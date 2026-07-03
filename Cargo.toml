@@ -1,0 +1,22 @@
+[package]
+name = "lite-agent"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "lite_agent"
+path = "src/lib.rs"
+
+[[bin]]
+name = "lite-agent"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.13", features = ["json"] }
+thiserror = "2"
+tokio = { version = "1", features = ["fs", "macros", "rt-multi-thread", "io-std", "io-util"] }
+
+[dev-dependencies]
+tempfile = "3"
