@@ -1,14 +1,18 @@
 use lite_agent::functions::{FunctionExecution, SimpleFunction};
 use lite_agent::model::FunctionSpec;
+use lite_agent::FunctionContext;
 use lite_agent::{
     builtin_registry, Agent, AgentConfig, ChatCompletionsClient, FunctionRegistry,
     JsonFileThreadStore, ModelConfig, TurnOutcome,
 };
 use serde_json::json;
 use std::env;
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::process::Command as TokioCommand;
+use tokio::time::{timeout, Duration};
 
 #[derive(Debug)]
 struct ReplArgs {
@@ -17,6 +21,7 @@ struct ReplArgs {
     model: String,
     base_url: String,
     api_key: String,
+    command_cwd: PathBuf,
 }
 
 #[derive(Debug)]
@@ -44,36 +49,108 @@ async fn main() -> lite_agent::Result<()> {
         AgentConfig::default(),
         store,
         model_client,
-        example_registry(),
+        example_registry(args.command_cwd),
     );
 
     run_repl(agent, thread_id).await
 }
 
-fn example_registry() -> FunctionRegistry {
+fn example_registry(command_cwd: PathBuf) -> FunctionRegistry {
     let mut registry = builtin_registry();
-    registry.register(SimpleFunction::new(
+    registry.register(exec_command_function(command_cwd));
+    registry
+}
+
+fn exec_command_function(command_cwd: PathBuf) -> impl lite_agent::functions::AgentFunction {
+    SimpleFunction::new(
         FunctionSpec {
-            name: "echo_json".to_string(),
-            description: "Echo the provided JSON payload. Useful for testing custom functions."
-                .to_string(),
+            name: "exec_command".to_string(),
+            description: concat!(
+                "Run a shell command for local project testing. ",
+                "Use it for multi-step tasks such as listing directories, creating files, ",
+                "and writing markdown inside the configured working directory."
+            )
+            .to_string(),
             parameters: json!({
                 "type": "object",
+                "required": ["cmd"],
                 "properties": {
-                    "payload": {}
+                    "cmd": {
+                        "type": "string",
+                        "description": "Shell command to run."
+                    },
+                    "timeout_ms": {
+                        "type": "integer",
+                        "description": "Optional timeout in milliseconds. Defaults to 30000."
+                    }
                 },
-                "additionalProperties": true
+                "additionalProperties": false
             }),
         },
-        |args, _context| async move {
-            Ok(FunctionExecution::Completed {
-                output: json!({ "echo": args }),
-                thread_update: None,
-                extra_items: Vec::new(),
-            })
+        move |args: serde_json::Value, _context: FunctionContext| {
+            let cwd = command_cwd.clone();
+            async move {
+                let cmd = args
+                    .get("cmd")
+                    .and_then(|value| value.as_str())
+                    .ok_or_else(|| lite_agent::AgentError::InvalidFunctionArguments {
+                        name: "exec_command".to_string(),
+                        message: "missing string field: cmd".to_string(),
+                    })?
+                    .to_string();
+                let timeout_ms = args
+                    .get("timeout_ms")
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(30_000);
+
+                let output = run_shell_command(&cwd, &cmd, timeout_ms).await?;
+                Ok(FunctionExecution::Completed {
+                    output,
+                    thread_update: None,
+                    extra_items: Vec::new(),
+                })
+            }
         },
-    ));
-    registry
+    )
+}
+
+async fn run_shell_command(
+    cwd: &Path,
+    cmd: &str,
+    timeout_ms: u64,
+) -> lite_agent::Result<serde_json::Value> {
+    let mut command = TokioCommand::new("/bin/zsh");
+    command.arg("-lc").arg(cmd).current_dir(cwd);
+
+    let output = timeout(Duration::from_millis(timeout_ms), command.output())
+        .await
+        .map_err(|_| lite_agent::AgentError::Function {
+            name: "exec_command".to_string(),
+            message: format!("command timed out after {timeout_ms}ms"),
+        })?
+        .map_err(|error| lite_agent::AgentError::Function {
+            name: "exec_command".to_string(),
+            message: error.to_string(),
+        })?;
+
+    Ok(json!({
+        "cwd": cwd.display().to_string(),
+        "cmd": cmd,
+        "exit_code": output.status.code(),
+        "success": output.status.success(),
+        "stdout": truncate_output(&String::from_utf8_lossy(&output.stdout)),
+        "stderr": truncate_output(&String::from_utf8_lossy(&output.stderr)),
+    }))
+}
+
+fn truncate_output(output: &str) -> String {
+    const MAX_CHARS: usize = 20_000;
+    if output.chars().count() <= MAX_CHARS {
+        return output.to_string();
+    }
+    let mut truncated: String = output.chars().take(MAX_CHARS).collect();
+    truncated.push_str("\n...[truncated]");
+    truncated
 }
 
 fn parse_args() -> lite_agent::Result<Command> {
@@ -95,6 +172,7 @@ fn parse_args() -> lite_agent::Result<Command> {
         base_url: env::var("LITE_AGENT_BASE_URL")
             .unwrap_or_else(|_| "https://api.openai.com/v1".to_string()),
         api_key: env::var("LITE_AGENT_API_KEY").unwrap_or_default(),
+        command_cwd: env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
     };
 
     while let Some(flag) = args.next() {
@@ -104,6 +182,7 @@ fn parse_args() -> lite_agent::Result<Command> {
             "--model" => parsed.model = args.next().unwrap_or_default(),
             "--base-url" => parsed.base_url = args.next().unwrap_or_default(),
             "--api-key" => parsed.api_key = args.next().unwrap_or_default(),
+            "--command-cwd" => parsed.command_cwd = PathBuf::from(args.next().unwrap_or_default()),
             "--help" | "-h" => {
                 return Ok(Command::Help);
             }
@@ -132,7 +211,7 @@ fn parse_args() -> lite_agent::Result<Command> {
 fn help_text() -> String {
     concat!(
         "usage: lite-agent-repl repl [--thread ID] [--state-dir PATH] ",
-        "[--model NAME] [--base-url URL] [--api-key KEY]"
+        "[--model NAME] [--base-url URL] [--api-key KEY] [--command-cwd PATH]"
     )
     .to_string()
 }
