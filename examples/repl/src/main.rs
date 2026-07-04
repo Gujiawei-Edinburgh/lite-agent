@@ -2,8 +2,8 @@ use lite_agent::functions::{FunctionExecution, SimpleFunction};
 use lite_agent::model::FunctionSpec;
 use lite_agent::FunctionContext;
 use lite_agent::{
-    builtin_registry, Agent, AgentConfig, ChatCompletionsClient, FunctionRegistry,
-    JsonFileThreadStore, ModelConfig, TurnOutcome,
+    builtin_registry, init_file_logging, Agent, AgentConfig, ChatCompletionsClient,
+    FunctionRegistry, JsonFileThreadStore, ModelConfig, TurnOutcome, TurnStreamEvent,
 };
 use serde_json::json;
 use std::env;
@@ -39,7 +39,8 @@ async fn main() -> lite_agent::Result<()> {
     let thread_id = args
         .thread
         .unwrap_or_else(|| lite_agent::events::new_id("thread"));
-    let store = Arc::new(JsonFileThreadStore::new(args.state_dir));
+    let _logging_guard = init_file_logging(&args.state_dir)?;
+    let store = Arc::new(JsonFileThreadStore::new(&args.state_dir));
     let model_client = Arc::new(ChatCompletionsClient::new(ModelConfig {
         base_url: args.base_url,
         api_key: args.api_key,
@@ -238,7 +239,10 @@ async fn run_repl(agent: Agent, thread_id: String) -> lite_agent::Result<()> {
             continue;
         }
 
-        match agent.run_turn(&thread_id, input.to_string()).await? {
+        match agent
+            .run_turn_stream(&thread_id, input.to_string(), print_stream_event)
+            .await?
+        {
             TurnOutcome::AssistantMessage { text } => {
                 stdout.write_all(text.as_bytes()).await?;
                 stdout.write_all(b"\n").await?;
@@ -259,4 +263,45 @@ async fn run_repl(agent: Agent, thread_id: String) -> lite_agent::Result<()> {
     }
 
     Ok(())
+}
+
+fn print_stream_event(event: TurnStreamEvent) {
+    match event {
+        TurnStreamEvent::TurnStarted { turn_id, .. } => {
+            println!("[turn started] {turn_id}");
+        }
+        TurnStreamEvent::ModelRequestStarted { iteration } => {
+            println!("[model] iteration {iteration}");
+        }
+        TurnStreamEvent::FunctionCallsRequested { calls } => {
+            for call in calls {
+                println!("[function requested] {} {}", call.name, call.arguments);
+            }
+        }
+        TurnStreamEvent::FunctionStarted { call_id, name } => {
+            println!("[function started] {name} ({call_id})");
+        }
+        TurnStreamEvent::FunctionCompleted { call_id, name } => {
+            println!("[function completed] {name} ({call_id})");
+        }
+        TurnStreamEvent::FunctionFailed {
+            call_id,
+            name,
+            error,
+        } => {
+            println!("[function failed] {name} ({call_id}): {error}");
+        }
+        TurnStreamEvent::WaitingForUser { prompt, .. } => {
+            println!("[waiting for user] {prompt}");
+        }
+        TurnStreamEvent::TurnFailed { error } => {
+            println!("[turn failed] {error}");
+        }
+        TurnStreamEvent::ModelMessageDelta { text } => {
+            print!("{text}");
+        }
+        TurnStreamEvent::ModelMessage { .. } | TurnStreamEvent::TurnCompleted { .. } => {
+            println!();
+        }
+    }
 }

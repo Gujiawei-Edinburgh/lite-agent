@@ -177,7 +177,7 @@ pub fn new_id(prefix: &str) -> String {
     format!("{prefix}_{millis}_{counter}")
 }
 
-fn now_timestamp() -> String {
+pub fn now_timestamp() -> String {
     let seconds = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())

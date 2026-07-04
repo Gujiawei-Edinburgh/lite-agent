@@ -36,4 +36,7 @@ pub enum AgentError {
 
     #[error("turn exceeded max model iterations: {0}")]
     MaxIterations(usize),
+
+    #[error("logging error: {0}")]
+    Logging(String),
 }

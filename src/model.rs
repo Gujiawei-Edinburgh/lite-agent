@@ -1,7 +1,9 @@
 use crate::error::{AgentError, Result};
 use crate::projection::ChatMessage;
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
 
@@ -38,11 +40,32 @@ pub struct ModelFunctionCall {
     pub arguments: Value,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum ModelStreamEvent {
+    AssistantDelta { text: String },
+}
+
+pub type ModelStreamHandler<'a> = dyn FnMut(ModelStreamEvent) + Send + 'a;
+
 pub trait ModelClient: Send + Sync {
     fn complete<'a>(
         &'a self,
         request: ModelRequest,
     ) -> Pin<Box<dyn Future<Output = Result<ModelResponse>> + Send + 'a>>;
+
+    fn stream_complete<'a>(
+        &'a self,
+        request: ModelRequest,
+        on_event: &'a mut ModelStreamHandler<'a>,
+    ) -> Pin<Box<dyn Future<Output = Result<ModelResponse>> + Send + 'a>> {
+        Box::pin(async move {
+            let response = self.complete(request).await?;
+            if let ModelResponse::AssistantMessage { text } = &response {
+                on_event(ModelStreamEvent::AssistantDelta { text: text.clone() });
+            }
+            Ok(response)
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -70,7 +93,7 @@ impl ModelClient for ChatCompletionsClient {
                 "{}/chat/completions",
                 self.config.base_url.trim_end_matches('/')
             );
-            let body = OpenAiChatRequest::from_model_request(&self.config.model, request);
+            let body = OpenAiChatRequest::from_model_request(&self.config.model, request, false);
             let response = self
                 .http
                 .post(url)
@@ -117,6 +140,66 @@ impl ModelClient for ChatCompletionsClient {
             }
         })
     }
+
+    fn stream_complete<'a>(
+        &'a self,
+        request: ModelRequest,
+        on_event: &'a mut ModelStreamHandler<'a>,
+    ) -> Pin<Box<dyn Future<Output = Result<ModelResponse>> + Send + 'a>> {
+        Box::pin(async move {
+            let url = format!(
+                "{}/chat/completions",
+                self.config.base_url.trim_end_matches('/')
+            );
+            let body = OpenAiChatRequest::from_model_request(&self.config.model, request, true);
+            let response = self
+                .http
+                .post(url)
+                .bearer_auth(&self.config.api_key)
+                .json(&body)
+                .send()
+                .await?;
+            let status = response.status();
+            if !status.is_success() {
+                let raw = response.text().await?;
+                return Err(AgentError::Http(format!(
+                    "HTTP status {status} for streamed chat/completions: {raw}"
+                )));
+            }
+
+            let mut stream = response.bytes_stream();
+            let mut buffer = String::new();
+            let mut assistant_text = String::new();
+            let mut tool_calls = BTreeMap::<usize, PartialToolCall>::new();
+
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk?;
+                buffer.push_str(&String::from_utf8_lossy(&chunk));
+
+                while let Some(frame_end) = buffer.find("\n\n") {
+                    let frame = buffer[..frame_end].to_string();
+                    buffer.drain(..frame_end + 2);
+                    handle_sse_frame(&frame, &mut assistant_text, &mut tool_calls, on_event)
+                        .await?;
+                }
+            }
+            if !buffer.trim().is_empty() {
+                handle_sse_frame(&buffer, &mut assistant_text, &mut tool_calls, on_event).await?;
+            }
+
+            if !tool_calls.is_empty() {
+                let calls = tool_calls
+                    .into_values()
+                    .map(PartialToolCall::finish)
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(ModelResponse::FunctionCalls { calls })
+            } else {
+                Ok(ModelResponse::AssistantMessage {
+                    text: assistant_text,
+                })
+            }
+        })
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -129,7 +212,7 @@ struct OpenAiChatRequest {
 }
 
 impl OpenAiChatRequest {
-    fn from_model_request(model: &str, request: ModelRequest) -> Self {
+    fn from_model_request(model: &str, request: ModelRequest, stream: bool) -> Self {
         Self {
             model: model.to_string(),
             messages: request
@@ -146,7 +229,7 @@ impl OpenAiChatRequest {
                 })
                 .collect(),
             tool_choice: "auto",
-            stream: false,
+            stream,
         }
     }
 }
@@ -271,11 +354,117 @@ struct OpenAiFunctionCall {
     arguments: String,
 }
 
+#[derive(Debug, Default)]
+struct PartialToolCall {
+    call_id: Option<String>,
+    name: Option<String>,
+    arguments: String,
+}
+
+impl PartialToolCall {
+    fn apply_delta(&mut self, delta: OpenAiStreamToolCall) {
+        if let Some(id) = delta.id {
+            self.call_id = Some(id);
+        }
+        if let Some(function) = delta.function {
+            if let Some(name) = function.name {
+                self.name = Some(name);
+            }
+            if let Some(arguments) = function.arguments {
+                self.arguments.push_str(&arguments);
+            }
+        }
+    }
+
+    fn finish(self) -> Result<ModelFunctionCall> {
+        let call_id = self
+            .call_id
+            .ok_or_else(|| AgentError::Model("streamed tool call missing id".to_string()))?;
+        let name = self.name.ok_or_else(|| {
+            AgentError::Model(format!("streamed tool call {call_id} missing name"))
+        })?;
+        let arguments = serde_json::from_str(&self.arguments).map_err(|error| {
+            AgentError::Model(format!(
+                "invalid JSON arguments for streamed tool call {call_id}: {error}"
+            ))
+        })?;
+        Ok(ModelFunctionCall {
+            call_id,
+            name,
+            arguments,
+        })
+    }
+}
+
+async fn handle_sse_frame(
+    frame: &str,
+    assistant_text: &mut String,
+    tool_calls: &mut BTreeMap<usize, PartialToolCall>,
+    on_event: &mut ModelStreamHandler<'_>,
+) -> Result<()> {
+    for line in frame.lines() {
+        let Some(data) = line.strip_prefix("data:") else {
+            continue;
+        };
+        let data = data.trim();
+        if data.is_empty() || data == "[DONE]" {
+            continue;
+        }
+        let event: OpenAiChatStreamResponse = serde_json::from_str(data)?;
+        for choice in event.choices {
+            if let Some(content) = choice.delta.content {
+                assistant_text.push_str(&content);
+                on_event(ModelStreamEvent::AssistantDelta { text: content });
+            }
+            if let Some(deltas) = choice.delta.tool_calls {
+                for delta in deltas {
+                    tool_calls
+                        .entry(delta.index)
+                        .or_default()
+                        .apply_delta(delta);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiChatStreamResponse {
+    choices: Vec<OpenAiStreamChoice>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiStreamChoice {
+    delta: OpenAiStreamDelta,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiStreamDelta {
+    content: Option<String>,
+    tool_calls: Option<Vec<OpenAiStreamToolCall>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiStreamToolCall {
+    index: usize,
+    id: Option<String>,
+    function: Option<OpenAiStreamFunctionDelta>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiStreamFunctionDelta {
+    name: Option<String>,
+    arguments: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
+    use super::{handle_sse_frame, PartialToolCall};
     use super::{FunctionSpec, ModelFunctionCall, ModelRequest, OpenAiChatRequest};
     use crate::projection::ChatMessage;
     use serde_json::{json, Value};
+    use std::collections::BTreeMap;
 
     #[test]
     fn serializes_structured_tool_history() {
@@ -302,7 +491,7 @@ mod tests {
             }],
         };
 
-        let body = OpenAiChatRequest::from_model_request("model", request);
+        let body = OpenAiChatRequest::from_model_request("model", request, false);
         let value = serde_json::to_value(body).expect("json");
         let messages = value["messages"].as_array().expect("messages");
 
@@ -316,5 +505,51 @@ mod tests {
         assert_eq!(messages[1]["tool_call_id"], "call_1");
         assert_eq!(messages[1]["name"], Value::Null);
         assert_ne!(messages[1]["content"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn parses_streaming_content_deltas() {
+        let mut text = String::new();
+        let mut calls = BTreeMap::<usize, PartialToolCall>::new();
+        let mut deltas = Vec::new();
+        let frame = r#"data: {"choices":[{"delta":{"content":"hel"}}]}
+
+data: {"choices":[{"delta":{"content":"lo"}}]}
+
+data: [DONE]
+
+"#;
+
+        handle_sse_frame(frame, &mut text, &mut calls, &mut |event| {
+            deltas.push(event);
+        })
+        .await
+        .expect("frame");
+
+        assert_eq!(text, "hello");
+        assert_eq!(deltas.len(), 2);
+        assert!(calls.is_empty());
+    }
+
+    #[tokio::test]
+    async fn parses_streaming_tool_call_deltas() {
+        let mut text = String::new();
+        let mut calls = BTreeMap::<usize, PartialToolCall>::new();
+        let frame = r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"exec_command","arguments":"{\"cmd\""}}]}}]}
+
+data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":":\"ls\"}"}}]}}]}
+
+data: [DONE]
+
+"#;
+
+        handle_sse_frame(frame, &mut text, &mut calls, &mut |_event| {})
+            .await
+            .expect("frame");
+
+        let call = calls.remove(&0).expect("call").finish().expect("finish");
+        assert_eq!(call.call_id, "call_1");
+        assert_eq!(call.name, "exec_command");
+        assert_eq!(call.arguments, json!({ "cmd": "ls" }));
     }
 }

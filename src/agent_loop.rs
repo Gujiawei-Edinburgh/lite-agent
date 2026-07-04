@@ -3,7 +3,7 @@ use crate::events::{
     Thread, ToolResult, Turn, TurnId, TurnItem, TurnItemKind, TurnItemSource, TurnStatus,
 };
 use crate::functions::{FunctionContext, FunctionExecution, FunctionRegistry, ThreadUpdate};
-use crate::model::{ModelClient, ModelRequest, ModelResponse};
+use crate::model::{ModelClient, ModelRequest, ModelResponse, ModelStreamEvent};
 use crate::projection::{ChatMessage, ThreadProjection};
 use crate::store::ThreadStore;
 use std::sync::Arc;
@@ -34,6 +34,51 @@ pub enum TurnOutcome {
     WaitingForUser { request_id: String, prompt: String },
     Failed { error: String },
 }
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum TurnStreamEvent {
+    TurnStarted {
+        thread_id: String,
+        turn_id: TurnId,
+    },
+    ModelRequestStarted {
+        iteration: usize,
+    },
+    ModelMessage {
+        text: String,
+    },
+    ModelMessageDelta {
+        text: String,
+    },
+    FunctionCallsRequested {
+        calls: Vec<crate::model::ModelFunctionCall>,
+    },
+    FunctionStarted {
+        call_id: String,
+        name: String,
+    },
+    FunctionCompleted {
+        call_id: String,
+        name: String,
+    },
+    FunctionFailed {
+        call_id: String,
+        name: String,
+        error: String,
+    },
+    WaitingForUser {
+        request_id: String,
+        prompt: String,
+    },
+    TurnCompleted {
+        outcome: TurnOutcome,
+    },
+    TurnFailed {
+        error: String,
+    },
+}
+
+pub type TurnEventHandler<'a> = dyn FnMut(TurnStreamEvent) + Send + 'a;
 
 #[derive(Debug, Clone)]
 struct Session {
@@ -80,6 +125,19 @@ impl Agent {
         thread_id: &str,
         user_text: impl Into<String>,
     ) -> Result<TurnOutcome> {
+        self.run_turn_stream(thread_id, user_text, |_event| {})
+            .await
+    }
+
+    pub async fn run_turn_stream<'a, F>(
+        &self,
+        thread_id: &str,
+        user_text: impl Into<String>,
+        mut on_event: F,
+    ) -> Result<TurnOutcome>
+    where
+        F: FnMut(TurnStreamEvent) + Send + 'a,
+    {
         let mut thread = match self.store.load(thread_id).await {
             Ok(thread) => thread,
             Err(AgentError::ThreadNotFound(_)) => Thread::new(thread_id),
@@ -100,23 +158,46 @@ impl Agent {
         ));
         thread.turns.push(turn);
         thread = self.store.save(thread).await?;
+        tracing::info!(thread_id, turn_id, "turn started");
+        on_event(TurnStreamEvent::TurnStarted {
+            thread_id: thread_id.to_string(),
+            turn_id: turn_id.clone(),
+        });
 
-        for _ in 0..self.config.max_model_iterations {
+        for iteration in 0..self.config.max_model_iterations {
             let session = Session::from_thread(&thread, turn_id.clone());
             let request = self.model_request_from_projection(session.projection.clone());
-            let response = self.model_client.complete(request).await;
+            on_event(TurnStreamEvent::ModelRequestStarted { iteration });
+            let mut model_event_handler = |event| match event {
+                ModelStreamEvent::AssistantDelta { text } => {
+                    on_event(TurnStreamEvent::ModelMessageDelta { text });
+                }
+            };
+            let response = self
+                .model_client
+                .stream_complete(request, &mut model_event_handler)
+                .await;
             let response = match response {
                 Ok(response) => response,
                 Err(error) => {
                     let error = error.to_string();
+                    tracing::error!(error, "turn failed during model request");
                     self.fail_turn(&mut thread, &session.active_turn_id, error.clone())?;
                     self.store.save(thread).await?;
-                    return Ok(TurnOutcome::Failed { error });
+                    on_event(TurnStreamEvent::TurnFailed {
+                        error: error.clone(),
+                    });
+                    let outcome = TurnOutcome::Failed { error };
+                    on_event(TurnStreamEvent::TurnCompleted {
+                        outcome: outcome.clone(),
+                    });
+                    return Ok(outcome);
                 }
             };
 
             match response {
                 ModelResponse::AssistantMessage { text } => {
+                    on_event(TurnStreamEvent::ModelMessage { text: text.clone() });
                     Self::push_turn_items(
                         &mut thread,
                         &session.active_turn_id,
@@ -131,16 +212,31 @@ impl Agent {
                         TurnStatus::Completed,
                     )?;
                     self.store.save(thread).await?;
-                    return Ok(TurnOutcome::AssistantMessage { text });
+                    let outcome = TurnOutcome::AssistantMessage { text };
+                    on_event(TurnStreamEvent::TurnCompleted {
+                        outcome: outcome.clone(),
+                    });
+                    return Ok(outcome);
                 }
                 ModelResponse::FunctionCalls { calls } => {
                     if calls.is_empty() {
                         let error = "model returned an empty function call list".to_string();
+                        tracing::warn!(error, "empty function call list");
                         self.fail_turn(&mut thread, &session.active_turn_id, error.clone())?;
                         self.store.save(thread).await?;
-                        return Ok(TurnOutcome::Failed { error });
+                        on_event(TurnStreamEvent::TurnFailed {
+                            error: error.clone(),
+                        });
+                        let outcome = TurnOutcome::Failed { error };
+                        on_event(TurnStreamEvent::TurnCompleted {
+                            outcome: outcome.clone(),
+                        });
+                        return Ok(outcome);
                     }
 
+                    on_event(TurnStreamEvent::FunctionCallsRequested {
+                        calls: calls.clone(),
+                    });
                     let call_items = calls
                         .iter()
                         .map(|call| {
@@ -158,6 +254,12 @@ impl Agent {
                     thread = self.store.save(thread).await?;
 
                     for call in calls {
+                        let call_id = call.call_id.clone();
+                        let name = call.name.clone();
+                        on_event(TurnStreamEvent::FunctionStarted {
+                            call_id: call_id.clone(),
+                            name: name.clone(),
+                        });
                         let context = FunctionContext {
                             projection: ThreadProjection::from_thread(&thread),
                         };
@@ -176,13 +278,14 @@ impl Agent {
                                 extra_items.push(TurnItem::new(
                                     TurnItemSource::Tool,
                                     TurnItemKind::ToolOutput {
-                                        call_id: call.call_id,
-                                        name: call.name,
+                                        call_id: call_id.clone(),
+                                        name: name.clone(),
                                         result: ToolResult::Success { output },
                                     },
                                 ));
                                 Self::push_turn_items(&mut thread, &turn_id, extra_items)?;
                                 thread = self.store.save(thread).await?;
+                                on_event(TurnStreamEvent::FunctionCompleted { call_id, name });
                             }
                             Ok(FunctionExecution::WaitingForUser {
                                 request_id,
@@ -195,8 +298,8 @@ impl Agent {
                                 extra_items.push(TurnItem::new(
                                     TurnItemSource::Tool,
                                     TurnItemKind::ToolOutput {
-                                        call_id: call.call_id,
-                                        name: call.name,
+                                        call_id: call_id.clone(),
+                                        name: name.clone(),
                                         result: ToolResult::Success { output },
                                     },
                                 ));
@@ -207,24 +310,39 @@ impl Agent {
                                     TurnStatus::WaitingForUser,
                                 )?;
                                 self.store.save(thread).await?;
-                                return Ok(TurnOutcome::WaitingForUser { request_id, prompt });
+                                on_event(TurnStreamEvent::FunctionCompleted { call_id, name });
+                                on_event(TurnStreamEvent::WaitingForUser {
+                                    request_id: request_id.clone(),
+                                    prompt: prompt.clone(),
+                                });
+                                let outcome = TurnOutcome::WaitingForUser { request_id, prompt };
+                                on_event(TurnStreamEvent::TurnCompleted {
+                                    outcome: outcome.clone(),
+                                });
+                                return Ok(outcome);
                             }
                             Err(error) => {
+                                let error_text = error.to_string();
                                 Self::push_turn_items(
                                     &mut thread,
                                     &turn_id,
                                     vec![TurnItem::new(
                                         TurnItemSource::Tool,
                                         TurnItemKind::ToolOutput {
-                                            call_id: call.call_id,
-                                            name: call.name,
+                                            call_id: call_id.clone(),
+                                            name: name.clone(),
                                             result: ToolResult::Error {
-                                                error: error.to_string(),
+                                                error: error_text.clone(),
                                             },
                                         },
                                     )],
                                 )?;
                                 thread = self.store.save(thread).await?;
+                                on_event(TurnStreamEvent::FunctionFailed {
+                                    call_id,
+                                    name,
+                                    error: error_text,
+                                });
                             }
                         }
                     }
@@ -233,9 +351,17 @@ impl Agent {
         }
 
         let error = AgentError::MaxIterations(self.config.max_model_iterations).to_string();
+        tracing::warn!(error, "turn exceeded max iterations");
         self.fail_turn(&mut thread, &turn_id, error.clone())?;
         self.store.save(thread).await?;
-        Ok(TurnOutcome::Failed { error })
+        on_event(TurnStreamEvent::TurnFailed {
+            error: error.clone(),
+        });
+        let outcome = TurnOutcome::Failed { error };
+        on_event(TurnStreamEvent::TurnCompleted {
+            outcome: outcome.clone(),
+        });
+        Ok(outcome)
     }
 
     fn model_request_from_projection(&self, projection: ThreadProjection) -> ModelRequest {
@@ -302,7 +428,7 @@ mod tests {
     use crate::functions::builtin_registry;
     use crate::model::{ModelClient, ModelFunctionCall, ModelRequest, ModelResponse};
     use crate::store::{JsonFileThreadStore, ThreadStore};
-    use crate::{Agent, AgentConfig, Result, TurnOutcome};
+    use crate::{Agent, AgentConfig, Result, TurnOutcome, TurnStreamEvent};
     use serde_json::json;
     use std::collections::VecDeque;
     use std::future::Future;
@@ -367,6 +493,50 @@ mod tests {
         assert_eq!(thread.turns.len(), 1);
         assert_eq!(thread.turns[0].status, TurnStatus::Completed);
         assert_eq!(thread.turns[0].items.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn stream_emits_intermediate_and_final_events() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(JsonFileThreadStore::new(temp.path()));
+        let agent = agent_with(
+            store,
+            vec![
+                ModelResponse::FunctionCalls {
+                    calls: vec![ModelFunctionCall {
+                        call_id: "c1".to_string(),
+                        name: "get_goal".to_string(),
+                        arguments: json!({}),
+                    }],
+                },
+                ModelResponse::AssistantMessage {
+                    text: "done".to_string(),
+                },
+            ],
+        );
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let captured = events.clone();
+
+        let outcome = agent
+            .run_turn_stream("t", "goal?", move |event| {
+                captured.lock().expect("lock").push(event);
+            })
+            .await
+            .expect("turn");
+
+        assert_eq!(
+            outcome,
+            TurnOutcome::AssistantMessage {
+                text: "done".to_string()
+            }
+        );
+        let events = events.lock().expect("lock");
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, TurnStreamEvent::FunctionStarted { .. })));
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, TurnStreamEvent::TurnCompleted { .. })));
     }
 
     #[tokio::test]
