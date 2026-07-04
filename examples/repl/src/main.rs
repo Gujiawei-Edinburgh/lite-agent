@@ -7,9 +7,10 @@ use lite_agent::{
 };
 use serde_json::json;
 use std::env;
+use std::io::{self as std_io, Write};
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command as TokioCommand;
 use tokio::time::{timeout, Duration};
@@ -239,13 +240,27 @@ async fn run_repl(agent: Agent, thread_id: String) -> lite_agent::Result<()> {
             continue;
         }
 
-        match agent
-            .run_turn_stream(&thread_id, input.to_string(), print_stream_event)
-            .await?
-        {
+        let render_state = Arc::new(Mutex::new(StreamRenderState::default()));
+        let render_state_for_events = render_state.clone();
+        let outcome = agent
+            .run_turn_stream(&thread_id, input.to_string(), move |event| {
+                if let Ok(mut state) = render_state_for_events.lock() {
+                    print_stream_event(event, &mut state);
+                }
+            })
+            .await?;
+
+        match outcome {
             TurnOutcome::AssistantMessage { text } => {
-                stdout.write_all(text.as_bytes()).await?;
-                stdout.write_all(b"\n").await?;
+                let state = render_state.lock().expect("render state");
+                if !state.assistant_started {
+                    drop(state);
+                    stdout.write_all(text.as_bytes()).await?;
+                    stdout.write_all(b"\n").await?;
+                } else if !state.line_open {
+                    drop(state);
+                    stdout.write_all(b"\n").await?;
+                }
             }
             TurnOutcome::WaitingForUser { prompt, .. } => {
                 stdout.write_all(prompt.as_bytes()).await?;
@@ -265,43 +280,65 @@ async fn run_repl(agent: Agent, thread_id: String) -> lite_agent::Result<()> {
     Ok(())
 }
 
-fn print_stream_event(event: TurnStreamEvent) {
+#[derive(Default)]
+struct StreamRenderState {
+    assistant_started: bool,
+    line_open: bool,
+}
+
+fn print_stream_event(event: TurnStreamEvent, state: &mut StreamRenderState) {
     match event {
         TurnStreamEvent::TurnStarted { turn_id, .. } => {
-            println!("[turn started] {turn_id}");
+            print_process_line(state, &format!("[turn started] {turn_id}"));
         }
         TurnStreamEvent::ModelRequestStarted { iteration } => {
-            println!("[model] iteration {iteration}");
+            print_process_line(state, &format!("[model] iteration {iteration}"));
         }
         TurnStreamEvent::FunctionCallsRequested { calls } => {
             for call in calls {
-                println!("[function requested] {} {}", call.name, call.arguments);
+                print_process_line(
+                    state,
+                    &format!("[function requested] {} {}", call.name, call.arguments),
+                );
             }
         }
         TurnStreamEvent::FunctionStarted { call_id, name } => {
-            println!("[function started] {name} ({call_id})");
+            print_process_line(state, &format!("[function started] {name} ({call_id})"));
         }
         TurnStreamEvent::FunctionCompleted { call_id, name } => {
-            println!("[function completed] {name} ({call_id})");
+            print_process_line(state, &format!("[function completed] {name} ({call_id})"));
         }
         TurnStreamEvent::FunctionFailed {
             call_id,
             name,
             error,
         } => {
-            println!("[function failed] {name} ({call_id}): {error}");
+            print_process_line(
+                state,
+                &format!("[function failed] {name} ({call_id}): {error}"),
+            );
         }
         TurnStreamEvent::WaitingForUser { prompt, .. } => {
-            println!("[waiting for user] {prompt}");
+            print_process_line(state, &format!("[waiting for user] {prompt}"));
         }
         TurnStreamEvent::TurnFailed { error } => {
-            println!("[turn failed] {error}");
+            print_process_line(state, &format!("[turn failed] {error}"));
         }
         TurnStreamEvent::ModelMessageDelta { text } => {
+            state.assistant_started = true;
+            state.line_open = !text.ends_with('\n');
             print!("{text}");
+            let _ = std_io::stdout().flush();
         }
-        TurnStreamEvent::ModelMessage { .. } | TurnStreamEvent::TurnCompleted { .. } => {
-            println!();
-        }
+        TurnStreamEvent::ModelMessage { .. } | TurnStreamEvent::TurnCompleted { .. } => {}
     }
+}
+
+fn print_process_line(state: &mut StreamRenderState, line: &str) {
+    if state.line_open {
+        println!();
+        state.line_open = false;
+    }
+    println!("{line}");
+    let _ = std_io::stdout().flush();
 }
