@@ -44,6 +44,35 @@ pub trait AgentFunction: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<FunctionExecution>> + Send + 'a>>;
 }
 
+pub struct SimpleFunction<F> {
+    spec: FunctionSpec,
+    handler: F,
+}
+
+impl<F> SimpleFunction<F> {
+    pub fn new(spec: FunctionSpec, handler: F) -> Self {
+        Self { spec, handler }
+    }
+}
+
+impl<F, Fut> AgentFunction for SimpleFunction<F>
+where
+    F: Fn(Value, FunctionContext) -> Fut + Send + Sync,
+    Fut: Future<Output = Result<FunctionExecution>> + Send + 'static,
+{
+    fn spec(&self) -> FunctionSpec {
+        self.spec.clone()
+    }
+
+    fn call<'a>(
+        &'a self,
+        args: Value,
+        context: FunctionContext,
+    ) -> Pin<Box<dyn Future<Output = Result<FunctionExecution>> + Send + 'a>> {
+        Box::pin((self.handler)(args, context))
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct FunctionRegistry {
     functions: BTreeMap<String, Arc<dyn AgentFunction>>,

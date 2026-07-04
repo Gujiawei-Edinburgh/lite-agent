@@ -12,7 +12,10 @@ pub use events::{
     GoalState, GoalStatus, Thread, ThreadId, ToolResult, Turn, TurnId, TurnItem, TurnItemId,
     TurnItemKind, TurnItemSource, TurnStatus,
 };
-pub use functions::{builtin_registry, FunctionRegistry};
-pub use model::{ChatCompletionsClient, ModelClient, ModelConfig};
+pub use functions::{
+    builtin_registry, AgentFunction, FunctionContext, FunctionExecution, FunctionRegistry,
+    SimpleFunction, ThreadUpdate,
+};
+pub use model::{ChatCompletionsClient, FunctionSpec, ModelClient, ModelConfig};
 pub use projection::ThreadProjection;
 pub use store::{JsonFileThreadStore, ThreadStore};

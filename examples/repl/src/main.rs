@@ -1,7 +1,8 @@
 use lite_agent::{
-    builtin_registry, Agent, AgentConfig, ChatCompletionsClient, JsonFileThreadStore, ModelConfig,
-    TurnOutcome,
+    builtin_registry, Agent, AgentConfig, ChatCompletionsClient, FunctionExecution,
+    FunctionRegistry, FunctionSpec, JsonFileThreadStore, ModelConfig, SimpleFunction, TurnOutcome,
 };
+use serde_json::json;
 use std::env;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -16,9 +17,18 @@ struct ReplArgs {
     api_key: String,
 }
 
+#[derive(Debug)]
+enum Command {
+    Help,
+    Repl(ReplArgs),
+}
+
 #[tokio::main]
 async fn main() -> lite_agent::Result<()> {
-    let args = parse_args()?;
+    let Command::Repl(args) = parse_args()? else {
+        println!("{}", help_text());
+        return Ok(());
+    };
     let thread_id = args
         .thread
         .unwrap_or_else(|| lite_agent::events::new_id("thread"));
@@ -32,15 +42,44 @@ async fn main() -> lite_agent::Result<()> {
         AgentConfig::default(),
         store,
         model_client,
-        builtin_registry(),
+        example_registry(),
     );
 
     run_repl(agent, thread_id).await
 }
 
-fn parse_args() -> lite_agent::Result<ReplArgs> {
+fn example_registry() -> FunctionRegistry {
+    let mut registry = builtin_registry();
+    registry.register(SimpleFunction::new(
+        FunctionSpec {
+            name: "echo_json".to_string(),
+            description: "Echo the provided JSON payload. Useful for testing custom functions."
+                .to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "payload": {}
+                },
+                "additionalProperties": true
+            }),
+        },
+        |args, _context| async move {
+            Ok(FunctionExecution::Completed {
+                output: json!({ "echo": args }),
+                thread_update: None,
+                extra_items: Vec::new(),
+            })
+        },
+    ));
+    registry
+}
+
+fn parse_args() -> lite_agent::Result<Command> {
     let mut args = env::args().skip(1);
     let command = args.next().unwrap_or_else(|| "repl".to_string());
+    if command == "--help" || command == "-h" {
+        return Ok(Command::Help);
+    }
     if command != "repl" {
         return Err(lite_agent::AgentError::Model(format!(
             "unsupported command: {command}. expected: repl"
@@ -64,7 +103,7 @@ fn parse_args() -> lite_agent::Result<ReplArgs> {
             "--base-url" => parsed.base_url = args.next().unwrap_or_default(),
             "--api-key" => parsed.api_key = args.next().unwrap_or_default(),
             "--help" | "-h" => {
-                return Err(lite_agent::AgentError::Model(help_text()));
+                return Ok(Command::Help);
             }
             other => {
                 return Err(lite_agent::AgentError::Model(format!(
@@ -85,12 +124,12 @@ fn parse_args() -> lite_agent::Result<ReplArgs> {
         ));
     }
 
-    Ok(parsed)
+    Ok(Command::Repl(parsed))
 }
 
 fn help_text() -> String {
     concat!(
-        "usage: lite-agent repl [--thread ID] [--state-dir PATH] ",
+        "usage: lite-agent-repl repl [--thread ID] [--state-dir PATH] ",
         "[--model NAME] [--base-url URL] [--api-key KEY]"
     )
     .to_string()

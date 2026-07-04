@@ -3,13 +3,12 @@ name = "lite-agent"
 version = "0.1.0"
 edition = "2021"
 
+[workspace]
+members = ["examples/repl"]
+
 [lib]
 name = "lite_agent"
 path = "src/lib.rs"
-
-[[bin]]
-name = "lite-agent"
-path = "src/main.rs"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
