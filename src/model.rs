@@ -1,5 +1,5 @@
 use crate::error::{AgentError, Result};
-use crate::projection::{ChatMessage, ChatRole};
+use crate::projection::ChatMessage;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::future::Future;
@@ -87,18 +87,21 @@ impl ModelClient for ChatCompletionsClient {
             })?;
 
             if let Some(tool_calls) = choice.message.tool_calls {
-                let calls = tool_calls
-                    .into_iter()
-                    .map(|call| {
-                        let arguments = serde_json::from_str(&call.function.arguments)
-                            .unwrap_or(Value::String(call.function.arguments));
-                        ModelFunctionCall {
-                            call_id: call.id,
-                            name: call.function.name,
-                            arguments,
-                        }
-                    })
-                    .collect();
+                let mut calls = Vec::with_capacity(tool_calls.len());
+                for call in tool_calls {
+                    let arguments =
+                        serde_json::from_str(&call.function.arguments).map_err(|error| {
+                            AgentError::Model(format!(
+                                "invalid JSON arguments for tool call {}: {error}",
+                                call.id
+                            ))
+                        })?;
+                    calls.push(ModelFunctionCall {
+                        call_id: call.id,
+                        name: call.function.name,
+                        arguments,
+                    });
+                }
                 Ok(ModelResponse::FunctionCalls { calls })
             } else if let Some(content) = choice.message.content {
                 Ok(ModelResponse::AssistantMessage { text: content })
@@ -146,28 +149,86 @@ impl OpenAiChatRequest {
 #[derive(Debug, Serialize)]
 struct OpenAiMessage {
     role: &'static str,
-    content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_call_id: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    tool_calls: Vec<OpenAiRequestToolCall>,
 }
 
 impl From<ChatMessage> for OpenAiMessage {
     fn from(message: ChatMessage) -> Self {
-        let role = match message.role {
-            ChatRole::System => "system",
-            ChatRole::User => "user",
-            ChatRole::Assistant => "assistant",
-            ChatRole::Tool => "tool",
-        };
-        Self {
-            role,
-            content: message.content,
-            name: message.name,
-            tool_call_id: message.tool_call_id,
+        match message {
+            ChatMessage::System { content } => Self {
+                role: "system",
+                content: Some(content),
+                name: None,
+                tool_call_id: None,
+                tool_calls: Vec::new(),
+            },
+            ChatMessage::User { content } => Self {
+                role: "user",
+                content: Some(content),
+                name: None,
+                tool_call_id: None,
+                tool_calls: Vec::new(),
+            },
+            ChatMessage::Assistant {
+                content,
+                tool_calls,
+            } => Self {
+                role: "assistant",
+                content,
+                name: None,
+                tool_call_id: None,
+                tool_calls: tool_calls
+                    .into_iter()
+                    .map(OpenAiRequestToolCall::from)
+                    .collect(),
+            },
+            ChatMessage::Tool {
+                tool_call_id,
+                name,
+                content,
+            } => Self {
+                role: "tool",
+                content: Some(content.to_string()),
+                name: Some(name),
+                tool_call_id: Some(tool_call_id),
+                tool_calls: Vec::new(),
+            },
         }
     }
+}
+
+#[derive(Debug, Serialize)]
+struct OpenAiRequestToolCall {
+    id: String,
+    #[serde(rename = "type")]
+    kind: &'static str,
+    function: OpenAiRequestFunctionCall,
+}
+
+impl From<ModelFunctionCall> for OpenAiRequestToolCall {
+    fn from(call: ModelFunctionCall) -> Self {
+        Self {
+            id: call.call_id,
+            kind: "function",
+            function: OpenAiRequestFunctionCall {
+                name: call.name,
+                arguments: call.arguments.to_string(),
+            },
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct OpenAiRequestFunctionCall {
+    name: String,
+    arguments: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -203,4 +264,52 @@ struct OpenAiToolCall {
 struct OpenAiFunctionCall {
     name: String,
     arguments: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FunctionSpec, ModelFunctionCall, ModelRequest, OpenAiChatRequest};
+    use crate::projection::ChatMessage;
+    use serde_json::{json, Value};
+
+    #[test]
+    fn serializes_structured_tool_history() {
+        let request = ModelRequest {
+            messages: vec![
+                ChatMessage::Assistant {
+                    content: None,
+                    tool_calls: vec![ModelFunctionCall {
+                        call_id: "call_1".to_string(),
+                        name: "exec_command".to_string(),
+                        arguments: json!({ "cmd": "ls" }),
+                    }],
+                },
+                ChatMessage::Tool {
+                    tool_call_id: "call_1".to_string(),
+                    name: "exec_command".to_string(),
+                    content: json!({ "stdout": "src\n" }),
+                },
+            ],
+            functions: vec![FunctionSpec {
+                name: "exec_command".to_string(),
+                description: "run command".to_string(),
+                parameters: json!({ "type": "object" }),
+            }],
+        };
+
+        let body = OpenAiChatRequest::from_model_request("model", request);
+        let value = serde_json::to_value(body).expect("json");
+        let messages = value["messages"].as_array().expect("messages");
+
+        assert_eq!(messages[0]["role"], "assistant");
+        assert_eq!(messages[0]["tool_calls"][0]["id"], "call_1");
+        assert_eq!(
+            messages[0]["tool_calls"][0]["function"]["name"],
+            "exec_command"
+        );
+        assert_eq!(messages[1]["role"], "tool");
+        assert_eq!(messages[1]["tool_call_id"], "call_1");
+        assert_eq!(messages[1]["name"], "exec_command");
+        assert_ne!(messages[1]["content"], Value::Null);
+    }
 }

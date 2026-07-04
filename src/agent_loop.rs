@@ -4,7 +4,7 @@ use crate::events::{
 };
 use crate::functions::{FunctionContext, FunctionExecution, FunctionRegistry, ThreadUpdate};
 use crate::model::{ModelClient, ModelRequest, ModelResponse};
-use crate::projection::{ChatMessage, ChatRole, ThreadProjection};
+use crate::projection::{ChatMessage, ThreadProjection};
 use crate::store::ThreadStore;
 use std::sync::Arc;
 
@@ -237,25 +237,18 @@ impl Agent {
     }
 
     fn model_request_from_projection(&self, projection: ThreadProjection) -> ModelRequest {
-        let mut messages = vec![ChatMessage {
-            role: ChatRole::System,
-            content: self.config.system_prompt.clone(),
-            name: None,
-            tool_call_id: None,
-        }];
+        let mut system_content = self.config.system_prompt.clone();
         if let Some(goal) = &projection.goal {
-            messages.push(ChatMessage {
-                role: ChatRole::System,
-                content: format!(
-                    "Current thread goal: objective={}, status={:?}, notes={}",
-                    goal.objective,
-                    goal.status,
-                    goal.notes.as_deref().unwrap_or("")
-                ),
-                name: None,
-                tool_call_id: None,
-            });
+            system_content.push_str(&format!(
+                "\nCurrent thread goal: objective={}, status={:?}, notes={}",
+                goal.objective,
+                goal.status,
+                goal.notes.as_deref().unwrap_or("")
+            ));
         }
+        let mut messages = vec![ChatMessage::System {
+            content: system_content,
+        }];
         messages.extend(projection.messages_for_model);
 
         ModelRequest {

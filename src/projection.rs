@@ -1,4 +1,5 @@
 use crate::events::{GoalState, Thread, ToolResult, TurnId, TurnItemKind, TurnStatus};
+use crate::model::ModelFunctionCall;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -17,19 +18,23 @@ pub struct CompletedFunctionCall {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub enum ChatRole {
-    System,
-    User,
-    Assistant,
-    Tool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct ChatMessage {
-    pub role: ChatRole,
-    pub content: String,
-    pub name: Option<String>,
-    pub tool_call_id: Option<String>,
+#[serde(tag = "role", rename_all = "snake_case")]
+pub enum ChatMessage {
+    System {
+        content: String,
+    },
+    User {
+        content: String,
+    },
+    Assistant {
+        content: Option<String>,
+        tool_calls: Vec<ModelFunctionCall>,
+    },
+    Tool {
+        tool_call_id: String,
+        name: String,
+        content: Value,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -66,11 +71,8 @@ impl ThreadProjection {
             for item in &turn.items {
                 match &item.kind {
                     TurnItemKind::UserInput { text, response_to } => {
-                        projection.messages_for_model.push(ChatMessage {
-                            role: ChatRole::User,
+                        projection.messages_for_model.push(ChatMessage::User {
                             content: text.clone(),
-                            name: None,
-                            tool_call_id: None,
                         });
                         if let Some(response_to) = response_to {
                             if projection
@@ -86,11 +88,9 @@ impl ThreadProjection {
                     }
                     TurnItemKind::ModelMessage { text } => {
                         projection.last_assistant_message = Some(text.clone());
-                        projection.messages_for_model.push(ChatMessage {
-                            role: ChatRole::Assistant,
-                            content: text.clone(),
-                            name: None,
-                            tool_call_id: None,
+                        projection.messages_for_model.push(ChatMessage::Assistant {
+                            content: Some(text.clone()),
+                            tool_calls: Vec::new(),
                         });
                     }
                     TurnItemKind::ModelFunctionCall {
@@ -98,11 +98,13 @@ impl ThreadProjection {
                         name,
                         arguments,
                     } => {
-                        projection.messages_for_model.push(ChatMessage {
-                            role: ChatRole::Assistant,
-                            content: format!("Function call requested: {name}({arguments})"),
-                            name: None,
-                            tool_call_id: Some(call_id.clone()),
+                        projection.messages_for_model.push(ChatMessage::Assistant {
+                            content: None,
+                            tool_calls: vec![ModelFunctionCall {
+                                call_id: call_id.clone(),
+                                name: name.clone(),
+                                arguments: arguments.clone(),
+                            }],
                         });
                     }
                     TurnItemKind::ToolOutput {
@@ -118,21 +120,17 @@ impl ThreadProjection {
                                     name: name.clone(),
                                     output: output.clone(),
                                 });
-                            projection.messages_for_model.push(ChatMessage {
-                                role: ChatRole::User,
-                                content: format!("Function {name} completed with output: {output}"),
-                                name: None,
-                                tool_call_id: None,
+                            projection.messages_for_model.push(ChatMessage::Tool {
+                                tool_call_id: call_id.clone(),
+                                name: name.clone(),
+                                content: output.clone(),
                             });
                         }
                         ToolResult::Error { error } => {
-                            projection.messages_for_model.push(ChatMessage {
-                                role: ChatRole::User,
-                                content: format!(
-                                    "Function {name} with call id {call_id} failed: {error}"
-                                ),
-                                name: None,
-                                tool_call_id: None,
+                            projection.messages_for_model.push(ChatMessage::Tool {
+                                tool_call_id: call_id.clone(),
+                                name: name.clone(),
+                                content: Value::String(error.clone()),
                             });
                         }
                     },
@@ -158,10 +156,11 @@ impl ThreadProjection {
 #[cfg(test)]
 mod tests {
     use crate::events::{
-        GoalState, GoalStatus, Thread, Turn, TurnItem, TurnItemKind, TurnItemSource,
+        GoalState, GoalStatus, Thread, ToolResult, Turn, TurnItem, TurnItemKind, TurnItemSource,
     };
+    use serde_json::json;
 
-    use super::ThreadProjection;
+    use super::{ChatMessage, ThreadProjection};
 
     #[test]
     fn copies_thread_goal() {
@@ -207,5 +206,42 @@ mod tests {
         assert!(ThreadProjection::from_thread(&thread)
             .pending_user_input_request
             .is_none());
+    }
+
+    #[test]
+    fn projects_function_call_and_tool_output_as_structured_messages() {
+        let mut thread = Thread::new("t");
+        let mut turn = Turn::new();
+        turn.push_item(TurnItem::new(
+            TurnItemSource::Model,
+            TurnItemKind::ModelFunctionCall {
+                call_id: "call_1".to_string(),
+                name: "exec_command".to_string(),
+                arguments: json!({ "cmd": "ls" }),
+            },
+        ));
+        turn.push_item(TurnItem::new(
+            TurnItemSource::Tool,
+            TurnItemKind::ToolOutput {
+                call_id: "call_1".to_string(),
+                name: "exec_command".to_string(),
+                result: ToolResult::Success {
+                    output: json!({ "stdout": "src\n" }),
+                },
+            },
+        ));
+        thread.turns.push(turn);
+
+        let projection = ThreadProjection::from_thread(&thread);
+        assert!(matches!(
+            &projection.messages_for_model[0],
+            ChatMessage::Assistant { tool_calls, .. }
+                if tool_calls.len() == 1 && tool_calls[0].call_id == "call_1"
+        ));
+        assert!(matches!(
+            &projection.messages_for_model[1],
+            ChatMessage::Tool { tool_call_id, content, .. }
+                if tool_call_id == "call_1" && content == &json!({ "stdout": "src\n" })
+        ));
     }
 }
