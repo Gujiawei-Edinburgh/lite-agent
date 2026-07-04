@@ -141,21 +141,23 @@ impl Agent {
                         return Ok(TurnOutcome::Failed { error });
                     }
 
-                    for call in calls {
-                        Self::push_turn_items(
-                            &mut thread,
-                            &session.active_turn_id,
-                            vec![TurnItem::new(
+                    let call_items = calls
+                        .iter()
+                        .map(|call| {
+                            TurnItem::new(
                                 TurnItemSource::Model,
                                 TurnItemKind::ModelFunctionCall {
                                     call_id: call.call_id.clone(),
                                     name: call.name.clone(),
                                     arguments: call.arguments.clone(),
                                 },
-                            )],
-                        )?;
-                        thread = self.store.save(thread).await?;
+                            )
+                        })
+                        .collect();
+                    Self::push_turn_items(&mut thread, &session.active_turn_id, call_items)?;
+                    thread = self.store.save(thread).await?;
 
+                    for call in calls {
                         let context = FunctionContext {
                             projection: ThreadProjection::from_thread(&thread),
                         };

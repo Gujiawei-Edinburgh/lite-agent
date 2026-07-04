@@ -71,16 +71,21 @@ impl ModelClient for ChatCompletionsClient {
                 self.config.base_url.trim_end_matches('/')
             );
             let body = OpenAiChatRequest::from_model_request(&self.config.model, request);
-            let response: OpenAiChatResponse = self
+            let response = self
                 .http
                 .post(url)
                 .bearer_auth(&self.config.api_key)
                 .json(&body)
                 .send()
-                .await?
-                .error_for_status()?
-                .json()
                 .await?;
+            let status = response.status();
+            let raw = response.text().await?;
+            if !status.is_success() {
+                return Err(AgentError::Http(format!(
+                    "HTTP status {status} for chat/completions: {raw}"
+                )));
+            }
+            let response: OpenAiChatResponse = serde_json::from_str(&raw)?;
 
             let choice = response.choices.into_iter().next().ok_or_else(|| {
                 AgentError::Model("chat/completions returned no choices".to_string())
@@ -191,12 +196,12 @@ impl From<ChatMessage> for OpenAiMessage {
             },
             ChatMessage::Tool {
                 tool_call_id,
-                name,
+                name: _,
                 content,
             } => Self {
                 role: "tool",
                 content: Some(content.to_string()),
-                name: Some(name),
+                name: None,
                 tool_call_id: Some(tool_call_id),
                 tool_calls: Vec::new(),
             },
@@ -309,7 +314,7 @@ mod tests {
         );
         assert_eq!(messages[1]["role"], "tool");
         assert_eq!(messages[1]["tool_call_id"], "call_1");
-        assert_eq!(messages[1]["name"], "exec_command");
+        assert_eq!(messages[1]["name"], Value::Null);
         assert_ne!(messages[1]["content"], Value::Null);
     }
 }

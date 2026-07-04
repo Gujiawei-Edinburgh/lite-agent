@@ -68,9 +68,11 @@ impl ThreadProjection {
         };
 
         for turn in &thread.turns {
+            let mut pending_tool_calls = Vec::new();
             for item in &turn.items {
                 match &item.kind {
                     TurnItemKind::UserInput { text, response_to } => {
+                        flush_tool_calls(&mut projection, &mut pending_tool_calls);
                         projection.messages_for_model.push(ChatMessage::User {
                             content: text.clone(),
                         });
@@ -87,6 +89,7 @@ impl ThreadProjection {
                         }
                     }
                     TurnItemKind::ModelMessage { text } => {
+                        flush_tool_calls(&mut projection, &mut pending_tool_calls);
                         projection.last_assistant_message = Some(text.clone());
                         projection.messages_for_model.push(ChatMessage::Assistant {
                             content: Some(text.clone()),
@@ -98,13 +101,10 @@ impl ThreadProjection {
                         name,
                         arguments,
                     } => {
-                        projection.messages_for_model.push(ChatMessage::Assistant {
-                            content: None,
-                            tool_calls: vec![ModelFunctionCall {
-                                call_id: call_id.clone(),
-                                name: name.clone(),
-                                arguments: arguments.clone(),
-                            }],
+                        pending_tool_calls.push(ModelFunctionCall {
+                            call_id: call_id.clone(),
+                            name: name.clone(),
+                            arguments: arguments.clone(),
                         });
                     }
                     TurnItemKind::ToolOutput {
@@ -113,6 +113,7 @@ impl ThreadProjection {
                         result,
                     } => match result {
                         ToolResult::Success { output } => {
+                            flush_tool_calls(&mut projection, &mut pending_tool_calls);
                             projection
                                 .completed_function_results
                                 .push(CompletedFunctionCall {
@@ -127,6 +128,7 @@ impl ThreadProjection {
                             });
                         }
                         ToolResult::Error { error } => {
+                            flush_tool_calls(&mut projection, &mut pending_tool_calls);
                             projection.messages_for_model.push(ChatMessage::Tool {
                                 tool_call_id: call_id.clone(),
                                 name: name.clone(),
@@ -135,6 +137,7 @@ impl ThreadProjection {
                         }
                     },
                     TurnItemKind::UserInputRequested { request_id, prompt } => {
+                        flush_tool_calls(&mut projection, &mut pending_tool_calls);
                         projection.pending_user_input_request = Some(UserInputRequest {
                             request_id: request_id.clone(),
                             prompt: prompt.clone(),
@@ -142,15 +145,32 @@ impl ThreadProjection {
                         });
                     }
                     TurnItemKind::GoalUpdated { current, .. } => {
+                        flush_tool_calls(&mut projection, &mut pending_tool_calls);
                         projection.goal = Some(current.clone());
                     }
-                    TurnItemKind::TurnFailed { .. } | TurnItemKind::TurnAborted { .. } => {}
+                    TurnItemKind::TurnFailed { .. } | TurnItemKind::TurnAborted { .. } => {
+                        flush_tool_calls(&mut projection, &mut pending_tool_calls);
+                    }
                 }
             }
+            flush_tool_calls(&mut projection, &mut pending_tool_calls);
         }
 
         projection
     }
+}
+
+fn flush_tool_calls(
+    projection: &mut ThreadProjection,
+    pending_tool_calls: &mut Vec<ModelFunctionCall>,
+) {
+    if pending_tool_calls.is_empty() {
+        return;
+    }
+    projection.messages_for_model.push(ChatMessage::Assistant {
+        content: None,
+        tool_calls: std::mem::take(pending_tool_calls),
+    });
 }
 
 #[cfg(test)]
@@ -242,6 +262,30 @@ mod tests {
             &projection.messages_for_model[1],
             ChatMessage::Tool { tool_call_id, content, .. }
                 if tool_call_id == "call_1" && content == &json!({ "stdout": "src\n" })
+        ));
+    }
+
+    #[test]
+    fn groups_consecutive_function_calls_into_one_assistant_message() {
+        let mut thread = Thread::new("t");
+        let mut turn = Turn::new();
+        for call_id in ["call_1", "call_2"] {
+            turn.push_item(TurnItem::new(
+                TurnItemSource::Model,
+                TurnItemKind::ModelFunctionCall {
+                    call_id: call_id.to_string(),
+                    name: "exec_command".to_string(),
+                    arguments: json!({ "cmd": "ls" }),
+                },
+            ));
+        }
+        thread.turns.push(turn);
+
+        let projection = ThreadProjection::from_thread(&thread);
+        assert_eq!(projection.messages_for_model.len(), 1);
+        assert!(matches!(
+            &projection.messages_for_model[0],
+            ChatMessage::Assistant { tool_calls, .. } if tool_calls.len() == 2
         ));
     }
 }
