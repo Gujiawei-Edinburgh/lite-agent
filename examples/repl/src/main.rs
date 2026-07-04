@@ -1,6 +1,8 @@
+use lite_agent::functions::{FunctionExecution, SimpleFunction};
+use lite_agent::model::FunctionSpec;
 use lite_agent::{
-    builtin_registry, Agent, AgentConfig, ChatCompletionsClient, FunctionExecution,
-    FunctionRegistry, FunctionSpec, JsonFileThreadStore, ModelConfig, SimpleFunction, TurnOutcome,
+    builtin_registry, Agent, AgentConfig, ChatCompletionsClient, FunctionRegistry,
+    JsonFileThreadStore, ModelConfig, TurnOutcome,
 };
 use serde_json::json;
 use std::env;
