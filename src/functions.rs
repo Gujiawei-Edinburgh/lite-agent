@@ -1,5 +1,5 @@
 use crate::error::{AgentError, Result};
-use crate::events::{new_id, GoalStatus, ThreadEvent, ThreadEventKind};
+use crate::events::{new_id, GoalState, GoalStatus, TurnItem, TurnItemKind, TurnItemSource};
 use crate::model::FunctionSpec;
 use crate::projection::ThreadProjection;
 use serde::Deserialize;
@@ -15,16 +15,23 @@ pub struct FunctionContext {
 }
 
 #[derive(Debug, Clone)]
+pub enum ThreadUpdate {
+    Goal(GoalState),
+}
+
+#[derive(Debug, Clone)]
 pub enum FunctionExecution {
     Completed {
         output: Value,
-        extra_events: Vec<ThreadEvent>,
+        thread_update: Option<ThreadUpdate>,
+        extra_items: Vec<TurnItem>,
     },
     WaitingForUser {
         request_id: String,
         prompt: String,
         output: Value,
-        extra_events: Vec<ThreadEvent>,
+        thread_update: Option<ThreadUpdate>,
+        extra_items: Vec<TurnItem>,
     },
 }
 
@@ -106,8 +113,9 @@ impl AgentFunction for GetGoal {
     ) -> Pin<Box<dyn Future<Output = Result<FunctionExecution>> + Send + 'a>> {
         Box::pin(async move {
             Ok(FunctionExecution::Completed {
-                output: json!({ "goal": context.projection.latest_goal }),
-                extra_events: Vec::new(),
+                output: json!({ "goal": context.projection.goal }),
+                thread_update: None,
+                extra_items: Vec::new(),
             })
         })
     }
@@ -146,7 +154,7 @@ impl AgentFunction for UpdateGoal {
     fn call<'a>(
         &'a self,
         args: Value,
-        _context: FunctionContext,
+        context: FunctionContext,
     ) -> Pin<Box<dyn Future<Output = Result<FunctionExecution>> + Send + 'a>> {
         Box::pin(async move {
             let parsed: UpdateGoalArgs = serde_json::from_value(args).map_err(|error| {
@@ -155,22 +163,23 @@ impl AgentFunction for UpdateGoal {
                     message: error.to_string(),
                 }
             })?;
-
-            let event = ThreadEvent::new(ThreadEventKind::GoalUpdated {
-                objective: parsed.objective.clone(),
+            let current = GoalState {
+                objective: parsed.objective,
                 status: parsed.status,
-                notes: parsed.notes.clone(),
-            });
+                notes: parsed.notes,
+            };
+            let item = TurnItem::new(
+                TurnItemSource::Runtime,
+                TurnItemKind::GoalUpdated {
+                    previous: context.projection.goal,
+                    current: current.clone(),
+                },
+            );
 
             Ok(FunctionExecution::Completed {
-                output: json!({
-                    "goal": {
-                        "objective": parsed.objective,
-                        "status": parsed.status,
-                        "notes": parsed.notes
-                    }
-                }),
-                extra_events: vec![event],
+                output: json!({ "goal": current }),
+                thread_update: Some(ThreadUpdate::Goal(current)),
+                extra_items: vec![item],
             })
         })
     }
@@ -212,10 +221,13 @@ impl AgentFunction for AskUser {
                 }
             })?;
             let request_id = new_id("req");
-            let event = ThreadEvent::new(ThreadEventKind::UserInputRequested {
-                request_id: request_id.clone(),
-                prompt: parsed.prompt.clone(),
-            });
+            let item = TurnItem::new(
+                TurnItemSource::Runtime,
+                TurnItemKind::UserInputRequested {
+                    request_id: request_id.clone(),
+                    prompt: parsed.prompt.clone(),
+                },
+            );
 
             Ok(FunctionExecution::WaitingForUser {
                 request_id: request_id.clone(),
@@ -225,7 +237,8 @@ impl AgentFunction for AskUser {
                     "prompt": parsed.prompt,
                     "status": "waiting_for_user"
                 }),
-                extra_events: vec![event],
+                thread_update: None,
+                extra_items: vec![item],
             })
         })
     }
@@ -233,14 +246,14 @@ impl AgentFunction for AskUser {
 
 #[cfg(test)]
 mod tests {
-    use crate::events::{GoalStatus, Thread, ThreadEventKind};
+    use crate::events::{GoalStatus, Thread, TurnItemKind};
     use crate::projection::ThreadProjection;
 
-    use super::{builtin_registry, FunctionContext, FunctionExecution};
+    use super::{builtin_registry, FunctionContext, FunctionExecution, ThreadUpdate};
     use serde_json::json;
 
     #[tokio::test]
-    async fn update_goal_returns_event() {
+    async fn update_goal_returns_thread_update_and_item() {
         let registry = builtin_registry();
         let execution = registry
             .call(
@@ -253,15 +266,21 @@ mod tests {
             .await
             .expect("call");
 
-        let FunctionExecution::Completed { extra_events, .. } = execution else {
+        let FunctionExecution::Completed {
+            thread_update,
+            extra_items,
+            ..
+        } = execution
+        else {
             panic!("expected completion");
         };
         assert!(matches!(
-            extra_events[0].kind,
-            ThreadEventKind::GoalUpdated {
-                status: GoalStatus::Active,
-                ..
-            }
+            thread_update,
+            Some(ThreadUpdate::Goal(goal)) if goal.status == GoalStatus::Active
+        ));
+        assert!(matches!(
+            extra_items[0].kind,
+            TurnItemKind::GoalUpdated { .. }
         ));
     }
 
@@ -281,7 +300,7 @@ mod tests {
 
         let FunctionExecution::WaitingForUser {
             prompt,
-            extra_events,
+            extra_items,
             ..
         } = execution
         else {
@@ -289,8 +308,8 @@ mod tests {
         };
         assert_eq!(prompt, "Which thread?");
         assert!(matches!(
-            extra_events[0].kind,
-            ThreadEventKind::UserInputRequested { .. }
+            extra_items[0].kind,
+            TurnItemKind::UserInputRequested { .. }
         ));
     }
 }

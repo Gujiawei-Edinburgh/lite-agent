@@ -7,6 +7,9 @@ pub enum AgentError {
     #[error("thread not found: {0}")]
     ThreadNotFound(String),
 
+    #[error("turn not found: {0}")]
+    TurnNotFound(String),
+
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 
