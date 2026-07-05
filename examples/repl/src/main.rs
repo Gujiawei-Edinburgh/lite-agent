@@ -1,7 +1,7 @@
-use lite_agent::functions::{FunctionExecution, SimpleFunction};
-use lite_agent::model::FunctionSpec;
-use lite_agent::FunctionContext;
-use lite_agent::{
+use lite_agent_core::functions::{FunctionExecution, SimpleFunction};
+use lite_agent_core::model::FunctionSpec;
+use lite_agent_core::FunctionContext;
+use lite_agent_core::{
     builtin_registry, init_file_logging, Agent, AgentConfig, ChatCompletionsClient,
     FunctionRegistry, JsonFileThreadStore, ModelConfig, TurnOutcome, TurnStreamEvent,
 };
@@ -32,14 +32,14 @@ enum Command {
 }
 
 #[tokio::main]
-async fn main() -> lite_agent::Result<()> {
+async fn main() -> lite_agent_core::Result<()> {
     let Command::Repl(args) = parse_args()? else {
         println!("{}", help_text());
         return Ok(());
     };
     let thread_id = args
         .thread
-        .unwrap_or_else(|| lite_agent::events::new_id("thread"));
+        .unwrap_or_else(|| lite_agent_core::events::new_id("thread"));
     let _logging_guard = init_file_logging(&args.state_dir)?;
     let store = Arc::new(JsonFileThreadStore::new(&args.state_dir));
     let model_client = Arc::new(ChatCompletionsClient::new(ModelConfig {
@@ -63,7 +63,7 @@ fn example_registry(command_cwd: PathBuf) -> FunctionRegistry {
     registry
 }
 
-fn exec_command_function(command_cwd: PathBuf) -> impl lite_agent::functions::AgentFunction {
+fn exec_command_function(command_cwd: PathBuf) -> impl lite_agent_core::functions::AgentFunction {
     SimpleFunction::new(
         FunctionSpec {
             name: "exec_command".to_string(),
@@ -95,7 +95,7 @@ fn exec_command_function(command_cwd: PathBuf) -> impl lite_agent::functions::Ag
                 let cmd = args
                     .get("cmd")
                     .and_then(|value| value.as_str())
-                    .ok_or_else(|| lite_agent::AgentError::InvalidFunctionArguments {
+                    .ok_or_else(|| lite_agent_core::AgentError::InvalidFunctionArguments {
                         name: "exec_command".to_string(),
                         message: "missing string field: cmd".to_string(),
                     })?
@@ -120,17 +120,17 @@ async fn run_shell_command(
     cwd: &Path,
     cmd: &str,
     timeout_ms: u64,
-) -> lite_agent::Result<serde_json::Value> {
+) -> lite_agent_core::Result<serde_json::Value> {
     let mut command = TokioCommand::new("/bin/zsh");
     command.arg("-lc").arg(cmd).current_dir(cwd);
 
     let output = timeout(Duration::from_millis(timeout_ms), command.output())
         .await
-        .map_err(|_| lite_agent::AgentError::Function {
+        .map_err(|_| lite_agent_core::AgentError::Function {
             name: "exec_command".to_string(),
             message: format!("command timed out after {timeout_ms}ms"),
         })?
-        .map_err(|error| lite_agent::AgentError::Function {
+        .map_err(|error| lite_agent_core::AgentError::Function {
             name: "exec_command".to_string(),
             message: error.to_string(),
         })?;
@@ -155,14 +155,14 @@ fn truncate_output(output: &str) -> String {
     truncated
 }
 
-fn parse_args() -> lite_agent::Result<Command> {
+fn parse_args() -> lite_agent_core::Result<Command> {
     let mut args = env::args().skip(1);
     let command = args.next().unwrap_or_else(|| "repl".to_string());
     if command == "--help" || command == "-h" {
         return Ok(Command::Help);
     }
     if command != "repl" {
-        return Err(lite_agent::AgentError::Model(format!(
+        return Err(lite_agent_core::AgentError::Model(format!(
             "unsupported command: {command}. expected: repl"
         )));
     }
@@ -189,7 +189,7 @@ fn parse_args() -> lite_agent::Result<Command> {
                 return Ok(Command::Help);
             }
             other => {
-                return Err(lite_agent::AgentError::Model(format!(
+                return Err(lite_agent_core::AgentError::Model(format!(
                     "unknown argument: {other}"
                 )));
             }
@@ -197,12 +197,12 @@ fn parse_args() -> lite_agent::Result<Command> {
     }
 
     if parsed.model.is_empty() {
-        return Err(lite_agent::AgentError::Model(
+        return Err(lite_agent_core::AgentError::Model(
             "missing --model or LITE_AGENT_MODEL".to_string(),
         ));
     }
     if parsed.api_key.is_empty() {
-        return Err(lite_agent::AgentError::Model(
+        return Err(lite_agent_core::AgentError::Model(
             "missing --api-key or LITE_AGENT_API_KEY".to_string(),
         ));
     }
@@ -218,7 +218,7 @@ fn help_text() -> String {
     .to_string()
 }
 
-async fn run_repl(agent: Agent, thread_id: String) -> lite_agent::Result<()> {
+async fn run_repl(agent: Agent, thread_id: String) -> lite_agent_core::Result<()> {
     let stdin = BufReader::new(io::stdin());
     let mut lines = stdin.lines();
     let mut stdout = io::stdout();

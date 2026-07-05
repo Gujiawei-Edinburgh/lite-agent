@@ -1,25 +1,3 @@
-[package]
-name = "lite-agent"
-version = "0.1.0"
-edition = "2021"
-
 [workspace]
-members = ["examples/repl"]
-
-[lib]
-name = "lite_agent"
-path = "src/lib.rs"
-
-[dependencies]
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-futures-util = "0.3"
-reqwest = { version = "0.13", features = ["json", "stream"] }
-thiserror = "2"
-tokio = { version = "1", features = ["fs", "macros", "rt-multi-thread", "io-std", "io-util", "sync", "time"] }
-tracing = "0.1"
-tracing-appender = "0.2"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
-
-[dev-dependencies]
-tempfile = "3"
+members = ["lite-agent-core", "examples/repl"]
+resolver = "2"
