@@ -6,6 +6,7 @@ use crate::functions::{FunctionContext, FunctionExecution, FunctionRegistry, Thr
 use crate::model::{ModelClient, ModelRequest, ModelResponse, ModelStreamEvent};
 use crate::projection::{ChatMessage, ThreadProjection};
 use crate::store::ThreadStore;
+use chrono::{Local, Utc};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
@@ -19,7 +20,7 @@ pub struct AgentConfig {
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
-            max_model_iterations: 8,
+            max_model_iterations: 128,
             system_prompt: concat!(
                 "You are a lite Q&A agent. Use functions only when they are useful. ",
                 "Thread goal is explicit durable state. Turn items are factual append-only records. ",
@@ -384,6 +385,11 @@ impl Agent {
 
     fn model_request_from_projection(&self, projection: ThreadProjection) -> ModelRequest {
         let mut system_content = self.config.system_prompt.clone();
+        system_content.push_str(&format!(
+            "\nCurrent time context: local={}, utc={}. Use this as the current date/time for time-sensitive answers.",
+            Local::now().format("%Y-%m-%d %H:%M:%S %:z"),
+            Utc::now().format("%Y-%m-%d %H:%M:%S UTC")
+        ));
         if let Some(goal) = &projection.goal {
             system_content.push_str(&format!(
                 "\nCurrent thread goal: objective={}, status={:?}, notes={}",
@@ -571,6 +577,28 @@ mod tests {
             .turns
             .iter()
             .all(|turn| turn.status == TurnStatus::Completed));
+    }
+
+    #[test]
+    fn model_request_includes_current_time_context() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(JsonFileThreadStore::new(temp.path()));
+        let agent = agent_with(
+            store,
+            vec![ModelResponse::AssistantMessage {
+                text: "hello".to_string(),
+            }],
+        );
+
+        let request = agent.model_request_from_projection(Default::default());
+        let Some(crate::projection::ChatMessage::System { content }) = request.messages.first()
+        else {
+            panic!("missing system message");
+        };
+
+        assert!(content.contains("Current time context: local="));
+        assert!(content.contains("utc="));
+        assert!(content.contains("time-sensitive answers"));
     }
 
     #[tokio::test]

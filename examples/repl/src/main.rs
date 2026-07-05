@@ -5,13 +5,14 @@ use lite_agent_core::{
     builtin_registry, init_file_logging, Agent, AgentConfig, ChatCompletionsClient,
     FunctionRegistry, JsonFileThreadStore, ModelConfig, TurnOutcome, TurnStreamEvent,
 };
+use rustyline::error::ReadlineError;
+use rustyline::DefaultEditor;
 use serde_json::json;
 use std::env;
 use std::io::{self as std_io, Write};
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command as TokioCommand;
 use tokio::time::{timeout, Duration};
 
@@ -219,26 +220,31 @@ fn help_text() -> String {
 }
 
 async fn run_repl(agent: Agent, thread_id: String) -> lite_agent_core::Result<()> {
-    let stdin = BufReader::new(io::stdin());
-    let mut lines = stdin.lines();
-    let mut stdout = io::stdout();
+    let mut editor = DefaultEditor::new().map_err(|error| {
+        lite_agent_core::AgentError::Model(format!("failed to initialize REPL: {error}"))
+    })?;
 
-    stdout
-        .write_all(format!("thread: {thread_id}\n").as_bytes())
-        .await?;
-    stdout.write_all(b"> ").await?;
-    stdout.flush().await?;
+    println!("thread: {thread_id}");
 
-    while let Some(line) = lines.next_line().await? {
+    loop {
+        let line = match editor.readline("> ") {
+            Ok(line) => line,
+            Err(ReadlineError::Interrupted) => continue,
+            Err(ReadlineError::Eof) => break,
+            Err(error) => {
+                return Err(lite_agent_core::AgentError::Model(format!(
+                    "failed to read input: {error}"
+                )));
+            }
+        };
         let input = line.trim();
         if input.eq_ignore_ascii_case("/exit") || input.eq_ignore_ascii_case("/quit") {
             break;
         }
         if input.is_empty() {
-            stdout.write_all(b"> ").await?;
-            stdout.flush().await?;
             continue;
         }
+        let _ = editor.add_history_entry(input);
 
         let render_state = Arc::new(Mutex::new(StreamRenderState::default()));
         let render_state_for_events = render_state.clone();
@@ -255,26 +261,19 @@ async fn run_repl(agent: Agent, thread_id: String) -> lite_agent_core::Result<()
                 let state = render_state.lock().expect("render state");
                 if !state.assistant_started {
                     drop(state);
-                    stdout.write_all(text.as_bytes()).await?;
-                    stdout.write_all(b"\n").await?;
-                } else if !state.line_open {
+                    println!("{text}");
+                } else if state.line_open {
                     drop(state);
-                    stdout.write_all(b"\n").await?;
+                    println!();
                 }
             }
             TurnOutcome::WaitingForUser { prompt, .. } => {
-                stdout.write_all(prompt.as_bytes()).await?;
-                stdout.write_all(b"\n").await?;
+                println!("{prompt}");
             }
             TurnOutcome::Failed { error } => {
-                stdout
-                    .write_all(format!("turn failed: {error}\n").as_bytes())
-                    .await?;
+                println!("turn failed: {error}");
             }
         }
-
-        stdout.write_all(b"> ").await?;
-        stdout.flush().await?;
     }
 
     Ok(())
@@ -325,10 +324,12 @@ fn print_stream_event(event: TurnStreamEvent, state: &mut StreamRenderState) {
             print_process_line(state, &format!("[turn failed] {error}"));
         }
         TurnStreamEvent::ModelMessageDelta { text } => {
-            state.assistant_started = true;
-            state.line_open = !text.ends_with('\n');
-            print!("{text}");
-            let _ = std_io::stdout().flush();
+            if !text.is_empty() {
+                state.assistant_started = true;
+                state.line_open = !text.ends_with('\n');
+                print!("{text}");
+                let _ = std_io::stdout().flush();
+            }
         }
         TurnStreamEvent::ModelMessage { .. } | TurnStreamEvent::TurnCompleted { .. } => {}
     }
@@ -341,4 +342,33 @@ fn print_process_line(state: &mut StreamRenderState, line: &str) {
     }
     println!("{line}");
     let _ = std_io::stdout().flush();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{print_stream_event, StreamRenderState};
+    use lite_agent_core::TurnStreamEvent;
+
+    #[test]
+    fn assistant_delta_marks_line_open_until_newline() {
+        let mut state = StreamRenderState::default();
+
+        print_stream_event(
+            TurnStreamEvent::ModelMessageDelta {
+                text: "你好".to_string(),
+            },
+            &mut state,
+        );
+        assert!(state.assistant_started);
+        assert!(state.line_open);
+
+        print_stream_event(
+            TurnStreamEvent::ModelMessageDelta {
+                text: "\n".to_string(),
+            },
+            &mut state,
+        );
+        assert!(state.assistant_started);
+        assert!(!state.line_open);
+    }
 }

@@ -56,15 +56,9 @@ pub trait ModelClient: Send + Sync {
     fn stream_complete<'a>(
         &'a self,
         request: ModelRequest,
-        on_event: &'a mut ModelStreamHandler<'a>,
+        _on_event: &'a mut ModelStreamHandler<'a>,
     ) -> Pin<Box<dyn Future<Output = Result<ModelResponse>> + Send + 'a>> {
-        Box::pin(async move {
-            let response = self.complete(request).await?;
-            if let ModelResponse::AssistantMessage { text } = &response {
-                on_event(ModelStreamEvent::AssistantDelta { text: text.clone() });
-            }
-            Ok(response)
-        })
+        Box::pin(async move { self.complete(request).await })
     }
 }
 
