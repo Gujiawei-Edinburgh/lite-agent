@@ -450,7 +450,9 @@ impl Agent {
 mod tests {
     use crate::events::{ToolResult, TurnItemKind, TurnStatus};
     use crate::functions::builtin_registry;
-    use crate::model::{ModelClient, ModelFunctionCall, ModelRequest, ModelResponse};
+    use crate::model::{
+        ModelClient, ModelFunctionCall, ModelRequest, ModelResponse, ModelStreamHandler,
+    };
     use crate::store::{JsonFileThreadStore, ThreadStore};
     use crate::{Agent, AgentConfig, Result, TurnOutcome, TurnStreamEvent};
     use serde_json::json;
@@ -474,9 +476,10 @@ mod tests {
     }
 
     impl ModelClient for MockModel {
-        fn complete<'a>(
+        fn stream_complete<'a>(
             &'a self,
             _request: ModelRequest,
+            _on_event: &'a mut ModelStreamHandler<'a>,
         ) -> Pin<Box<dyn Future<Output = Result<ModelResponse>> + Send + 'a>> {
             Box::pin(async move {
                 self.responses
@@ -500,9 +503,10 @@ mod tests {
     }
 
     impl ModelClient for SlowCountingModel {
-        fn complete<'a>(
+        fn stream_complete<'a>(
             &'a self,
             _request: ModelRequest,
+            _on_event: &'a mut ModelStreamHandler<'a>,
         ) -> Pin<Box<dyn Future<Output = Result<ModelResponse>> + Send + 'a>> {
             Box::pin(async move {
                 let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;

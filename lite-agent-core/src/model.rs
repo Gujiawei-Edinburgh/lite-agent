@@ -55,18 +55,11 @@ pub enum ModelStreamEvent {
 pub type ModelStreamHandler<'a> = dyn FnMut(ModelStreamEvent) + Send + 'a;
 
 pub trait ModelClient: Send + Sync {
-    fn complete<'a>(
-        &'a self,
-        request: ModelRequest,
-    ) -> Pin<Box<dyn Future<Output = Result<ModelResponse>> + Send + 'a>>;
-
     fn stream_complete<'a>(
         &'a self,
         request: ModelRequest,
-        _on_event: &'a mut ModelStreamHandler<'a>,
-    ) -> Pin<Box<dyn Future<Output = Result<ModelResponse>> + Send + 'a>> {
-        Box::pin(async move { self.complete(request).await })
-    }
+        on_event: &'a mut ModelStreamHandler<'a>,
+    ) -> Pin<Box<dyn Future<Output = Result<ModelResponse>> + Send + 'a>>;
 }
 
 #[derive(Debug, Clone)]
@@ -85,68 +78,6 @@ impl ChatCompletionsClient {
 }
 
 impl ModelClient for ChatCompletionsClient {
-    fn complete<'a>(
-        &'a self,
-        request: ModelRequest,
-    ) -> Pin<Box<dyn Future<Output = Result<ModelResponse>> + Send + 'a>> {
-        Box::pin(async move {
-            let url = format!(
-                "{}/chat/completions",
-                self.config.base_url.trim_end_matches('/')
-            );
-            let body = OpenAiChatRequest::from_model_request(
-                &self.config.model,
-                &self.config.reasoning_effort,
-                request,
-                false,
-            );
-            let response = self
-                .http
-                .post(url)
-                .bearer_auth(&self.config.api_key)
-                .json(&body)
-                .send()
-                .await?;
-            let status = response.status();
-            let raw = response.text().await?;
-            if !status.is_success() {
-                return Err(AgentError::Http(format!(
-                    "HTTP status {status} for chat/completions: {raw}"
-                )));
-            }
-            let response: OpenAiChatResponse = serde_json::from_str(&raw)?;
-
-            let choice = response.choices.into_iter().next().ok_or_else(|| {
-                AgentError::Model("chat/completions returned no choices".to_string())
-            })?;
-
-            if let Some(tool_calls) = choice.message.tool_calls {
-                let mut calls = Vec::with_capacity(tool_calls.len());
-                for call in tool_calls {
-                    let arguments =
-                        serde_json::from_str(&call.function.arguments).map_err(|error| {
-                            AgentError::Model(format!(
-                                "invalid JSON arguments for tool call {}: {error}",
-                                call.id
-                            ))
-                        })?;
-                    calls.push(ModelFunctionCall {
-                        call_id: call.id,
-                        name: call.function.name,
-                        arguments,
-                    });
-                }
-                Ok(ModelResponse::FunctionCalls { calls })
-            } else if let Some(content) = choice.message.content {
-                Ok(ModelResponse::AssistantMessage { text: content })
-            } else {
-                Err(AgentError::Model(
-                    "chat/completions response had no content or tool calls".to_string(),
-                ))
-            }
-        })
-    }
-
     fn stream_complete<'a>(
         &'a self,
         request: ModelRequest,
@@ -342,34 +273,6 @@ struct OpenAiTool {
     #[serde(rename = "type")]
     kind: &'static str,
     function: FunctionSpec,
-}
-
-#[derive(Debug, Deserialize)]
-struct OpenAiChatResponse {
-    choices: Vec<OpenAiChoice>,
-}
-
-#[derive(Debug, Deserialize)]
-struct OpenAiChoice {
-    message: OpenAiResponseMessage,
-}
-
-#[derive(Debug, Deserialize)]
-struct OpenAiResponseMessage {
-    content: Option<String>,
-    tool_calls: Option<Vec<OpenAiToolCall>>,
-}
-
-#[derive(Debug, Deserialize)]
-struct OpenAiToolCall {
-    id: String,
-    function: OpenAiFunctionCall,
-}
-
-#[derive(Debug, Deserialize)]
-struct OpenAiFunctionCall {
-    name: String,
-    arguments: String,
 }
 
 #[derive(Debug, Default)]
