@@ -6,7 +6,9 @@ use crate::functions::{FunctionContext, FunctionExecution, FunctionRegistry, Thr
 use crate::model::{ModelClient, ModelRequest, ModelResponse, ModelStreamEvent};
 use crate::projection::{ChatMessage, ThreadProjection};
 use crate::store::ThreadStore;
+use std::collections::BTreeMap;
 use std::sync::Arc;
+use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
@@ -103,6 +105,7 @@ pub struct Agent {
     store: Arc<dyn ThreadStore>,
     model_client: Arc<dyn ModelClient>,
     function_registry: FunctionRegistry,
+    session_locks: Arc<AsyncMutex<BTreeMap<String, Arc<AsyncMutex<()>>>>>,
 }
 
 impl Agent {
@@ -117,6 +120,7 @@ impl Agent {
             store,
             model_client,
             function_registry,
+            session_locks: Arc::new(AsyncMutex::new(BTreeMap::new())),
         }
     }
 
@@ -138,6 +142,9 @@ impl Agent {
     where
         F: FnMut(TurnStreamEvent) + Send + 'a,
     {
+        let _session_lock = self.acquire_session_lock(thread_id).await;
+        tracing::debug!(thread_id, "session lock acquired");
+
         let mut thread = match self.store.load(thread_id).await {
             Ok(thread) => thread,
             Err(AgentError::ThreadNotFound(_)) => Thread::new(thread_id),
@@ -364,6 +371,17 @@ impl Agent {
         Ok(outcome)
     }
 
+    async fn acquire_session_lock(&self, thread_id: &str) -> OwnedMutexGuard<()> {
+        let lock = {
+            let mut locks = self.session_locks.lock().await;
+            locks
+                .entry(thread_id.to_string())
+                .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+                .clone()
+        };
+        lock.lock_owned().await
+    }
+
     fn model_request_from_projection(&self, projection: ThreadProjection) -> ModelRequest {
         let mut system_content = self.config.system_prompt.clone();
         if let Some(goal) = &projection.goal {
@@ -433,7 +451,9 @@ mod tests {
     use std::collections::VecDeque;
     use std::future::Future;
     use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
+    use tokio::time::{sleep, Duration};
 
     struct MockModel {
         responses: Mutex<VecDeque<ModelResponse>>,
@@ -458,6 +478,34 @@ mod tests {
                     .expect("lock")
                     .pop_front()
                     .ok_or_else(|| crate::AgentError::Model("no mock response".to_string()))
+            })
+        }
+    }
+
+    struct SlowCountingModel {
+        active: Arc<AtomicUsize>,
+        max_active: Arc<AtomicUsize>,
+    }
+
+    impl SlowCountingModel {
+        fn new(active: Arc<AtomicUsize>, max_active: Arc<AtomicUsize>) -> Self {
+            Self { active, max_active }
+        }
+    }
+
+    impl ModelClient for SlowCountingModel {
+        fn complete<'a>(
+            &'a self,
+            _request: ModelRequest,
+        ) -> Pin<Box<dyn Future<Output = Result<ModelResponse>> + Send + 'a>> {
+            Box::pin(async move {
+                let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+                self.max_active.fetch_max(active, Ordering::SeqCst);
+                sleep(Duration::from_millis(50)).await;
+                self.active.fetch_sub(1, Ordering::SeqCst);
+                Ok(ModelResponse::AssistantMessage {
+                    text: "done".to_string(),
+                })
             })
         }
     }
@@ -493,6 +541,36 @@ mod tests {
         assert_eq!(thread.turns.len(), 1);
         assert_eq!(thread.turns[0].status, TurnStatus::Completed);
         assert_eq!(thread.turns[0].items.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn concurrent_turns_for_same_thread_are_serialized() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(JsonFileThreadStore::new(temp.path()));
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let agent = Arc::new(Agent::new(
+            AgentConfig::default(),
+            store.clone(),
+            Arc::new(SlowCountingModel::new(active, max_active.clone())),
+            builtin_registry(),
+        ));
+
+        let first_agent = agent.clone();
+        let first = tokio::spawn(async move { first_agent.run_turn("t", "first").await });
+        let second_agent = agent.clone();
+        let second = tokio::spawn(async move { second_agent.run_turn("t", "second").await });
+
+        first.await.expect("join").expect("first turn");
+        second.await.expect("join").expect("second turn");
+
+        assert_eq!(max_active.load(Ordering::SeqCst), 1);
+        let thread = store.load("t").await.expect("thread");
+        assert_eq!(thread.turns.len(), 2);
+        assert!(thread
+            .turns
+            .iter()
+            .all(|turn| turn.status == TurnStatus::Completed));
     }
 
     #[tokio::test]
