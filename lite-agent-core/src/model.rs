@@ -12,6 +12,13 @@ pub struct ModelConfig {
     pub base_url: String,
     pub api_key: String,
     pub model: String,
+    pub reasoning_effort: String,
+}
+
+impl ModelConfig {
+    pub fn default_reasoning_effort() -> String {
+        "medium".to_string()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -87,7 +94,12 @@ impl ModelClient for ChatCompletionsClient {
                 "{}/chat/completions",
                 self.config.base_url.trim_end_matches('/')
             );
-            let body = OpenAiChatRequest::from_model_request(&self.config.model, request, false);
+            let body = OpenAiChatRequest::from_model_request(
+                &self.config.model,
+                &self.config.reasoning_effort,
+                request,
+                false,
+            );
             let response = self
                 .http
                 .post(url)
@@ -145,7 +157,12 @@ impl ModelClient for ChatCompletionsClient {
                 "{}/chat/completions",
                 self.config.base_url.trim_end_matches('/')
             );
-            let body = OpenAiChatRequest::from_model_request(&self.config.model, request, true);
+            let body = OpenAiChatRequest::from_model_request(
+                &self.config.model,
+                &self.config.reasoning_effort,
+                request,
+                true,
+            );
             let response = self
                 .http
                 .post(url)
@@ -199,6 +216,7 @@ impl ModelClient for ChatCompletionsClient {
 #[derive(Debug, Serialize)]
 struct OpenAiChatRequest {
     model: String,
+    reasoning_effort: String,
     messages: Vec<OpenAiMessage>,
     tools: Vec<OpenAiTool>,
     tool_choice: &'static str,
@@ -206,9 +224,15 @@ struct OpenAiChatRequest {
 }
 
 impl OpenAiChatRequest {
-    fn from_model_request(model: &str, request: ModelRequest, stream: bool) -> Self {
+    fn from_model_request(
+        model: &str,
+        reasoning_effort: &str,
+        request: ModelRequest,
+        stream: bool,
+    ) -> Self {
         Self {
             model: model.to_string(),
+            reasoning_effort: reasoning_effort.to_string(),
             messages: request
                 .messages
                 .into_iter()
@@ -485,10 +509,11 @@ mod tests {
             }],
         };
 
-        let body = OpenAiChatRequest::from_model_request("model", request, false);
+        let body = OpenAiChatRequest::from_model_request("model", "medium", request, false);
         let value = serde_json::to_value(body).expect("json");
         let messages = value["messages"].as_array().expect("messages");
 
+        assert_eq!(value["reasoning_effort"], "medium");
         assert_eq!(messages[0]["role"], "assistant");
         assert_eq!(messages[0]["tool_calls"][0]["id"], "call_1");
         assert_eq!(

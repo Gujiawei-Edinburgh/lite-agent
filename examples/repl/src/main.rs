@@ -23,6 +23,7 @@ struct ReplArgs {
     model: String,
     base_url: String,
     api_key: String,
+    reasoning_effort: String,
     command_cwd: PathBuf,
 }
 
@@ -47,6 +48,7 @@ async fn main() -> lite_agent_core::Result<()> {
         base_url: args.base_url,
         api_key: args.api_key,
         model: args.model,
+        reasoning_effort: args.reasoning_effort,
     }));
     let agent = Agent::new(
         AgentConfig::default(),
@@ -175,6 +177,8 @@ fn parse_args() -> lite_agent_core::Result<Command> {
         base_url: env::var("LITE_AGENT_BASE_URL")
             .unwrap_or_else(|_| "https://api.openai.com/v1".to_string()),
         api_key: env::var("LITE_AGENT_API_KEY").unwrap_or_default(),
+        reasoning_effort: env::var("LITE_AGENT_REASONING_EFFORT")
+            .unwrap_or_else(|_| ModelConfig::default_reasoning_effort()),
         command_cwd: env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
     };
 
@@ -185,6 +189,7 @@ fn parse_args() -> lite_agent_core::Result<Command> {
             "--model" => parsed.model = args.next().unwrap_or_default(),
             "--base-url" => parsed.base_url = args.next().unwrap_or_default(),
             "--api-key" => parsed.api_key = args.next().unwrap_or_default(),
+            "--reasoning-effort" => parsed.reasoning_effort = args.next().unwrap_or_default(),
             "--command-cwd" => parsed.command_cwd = PathBuf::from(args.next().unwrap_or_default()),
             "--help" | "-h" => {
                 return Ok(Command::Help);
@@ -207,6 +212,9 @@ fn parse_args() -> lite_agent_core::Result<Command> {
             "missing --api-key or LITE_AGENT_API_KEY".to_string(),
         ));
     }
+    if parsed.reasoning_effort.is_empty() {
+        parsed.reasoning_effort = ModelConfig::default_reasoning_effort();
+    }
 
     Ok(Command::Repl(parsed))
 }
@@ -214,7 +222,8 @@ fn parse_args() -> lite_agent_core::Result<Command> {
 fn help_text() -> String {
     concat!(
         "usage: lite-agent-repl repl [--thread ID] [--state-dir PATH] ",
-        "[--model NAME] [--base-url URL] [--api-key KEY] [--command-cwd PATH]"
+        "[--model NAME] [--base-url URL] [--api-key KEY] ",
+        "[--reasoning-effort VALUE] [--command-cwd PATH]"
     )
     .to_string()
 }
