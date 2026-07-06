@@ -7,7 +7,9 @@ pub mod model;
 pub mod projection;
 pub mod store;
 
-pub use agent_loop::{Agent, AgentConfig, TurnOutcome, TurnStreamEvent};
+pub use agent_loop::{
+    Agent, AgentConfig, RuntimeContextInput, RuntimeContextProvider, TurnOutcome, TurnStreamEvent,
+};
 pub use error::{AgentError, Result};
 pub use events::{
     GoalState, GoalStatus, Thread, ThreadId, ToolResult, Turn, TurnId, TurnItem, TurnItemId,

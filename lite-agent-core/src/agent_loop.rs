@@ -11,10 +11,34 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
-#[derive(Debug, Clone)]
+pub trait RuntimeContextProvider: Send + Sync {
+    fn context_for_turn(&self, input: RuntimeContextInput<'_>) -> Option<String>;
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct RuntimeContextInput<'a> {
+    pub thread_id: &'a str,
+    pub user_text: &'a str,
+}
+
+#[derive(Clone)]
 pub struct AgentConfig {
     pub max_model_iterations: usize,
     pub system_prompt: String,
+    pub runtime_context_provider: Option<Arc<dyn RuntimeContextProvider>>,
+}
+
+impl std::fmt::Debug for AgentConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AgentConfig")
+            .field("max_model_iterations", &self.max_model_iterations)
+            .field("system_prompt", &self.system_prompt)
+            .field(
+                "runtime_context_provider",
+                &self.runtime_context_provider.is_some(),
+            )
+            .finish()
+    }
 }
 
 impl Default for AgentConfig {
@@ -27,6 +51,7 @@ impl Default for AgentConfig {
                 "Ask the user when required information is missing."
             )
             .to_string(),
+            runtime_context_provider: None,
         }
     }
 }
@@ -146,6 +171,18 @@ impl Agent {
         let _session_lock = self.acquire_session_lock(thread_id).await;
         tracing::debug!(thread_id, "session lock acquired");
 
+        let user_text = user_text.into();
+        let runtime_context = self
+            .config
+            .runtime_context_provider
+            .as_ref()
+            .and_then(|provider| {
+                provider.context_for_turn(RuntimeContextInput {
+                    thread_id,
+                    user_text: &user_text,
+                })
+            });
+
         let mut thread = match self.store.load(thread_id).await {
             Ok(thread) => thread,
             Err(AgentError::ThreadNotFound(_)) => Thread::new(thread_id),
@@ -160,7 +197,7 @@ impl Agent {
         turn.push_item(TurnItem::new(
             TurnItemSource::User,
             TurnItemKind::UserInput {
-                text: user_text.into(),
+                text: user_text,
                 response_to,
             },
         ));
@@ -174,7 +211,10 @@ impl Agent {
 
         for iteration in 0..self.config.max_model_iterations {
             let session = Session::from_thread(&thread, turn_id.clone());
-            let request = self.model_request_from_projection(session.projection.clone());
+            let request = self.model_request_from_projection(
+                session.projection.clone(),
+                runtime_context.as_deref(),
+            );
             on_event(TurnStreamEvent::ModelRequestStarted { iteration });
             let mut model_event_handler = |event| match event {
                 ModelStreamEvent::AssistantDelta { text } => {
@@ -383,8 +423,21 @@ impl Agent {
         lock.lock_owned().await
     }
 
-    fn model_request_from_projection(&self, projection: ThreadProjection) -> ModelRequest {
+    fn model_request_from_projection(
+        &self,
+        projection: ThreadProjection,
+        runtime_context: Option<&str>,
+    ) -> ModelRequest {
         let mut system_content = self.config.system_prompt.clone();
+        if let Some(runtime_context) = runtime_context {
+            let runtime_context = runtime_context.trim();
+            if !runtime_context.is_empty() {
+                system_content.push_str(
+                    "\nCurrent turn runtime context. This host-supplied context applies only to this model request and is not durable thread state:\n",
+                );
+                system_content.push_str(runtime_context);
+            }
+        }
         system_content.push_str(&format!(
             "\nCurrent time context: local={}, utc={}. Use this as the current date/time for time-sensitive answers.",
             Local::now().format("%Y-%m-%d %H:%M:%S %:z"),
@@ -454,7 +507,10 @@ mod tests {
         ModelClient, ModelFunctionCall, ModelRequest, ModelResponse, ModelStreamHandler,
     };
     use crate::store::{JsonFileThreadStore, ThreadStore};
-    use crate::{Agent, AgentConfig, Result, TurnOutcome, TurnStreamEvent};
+    use crate::{
+        Agent, AgentConfig, Result, RuntimeContextInput, RuntimeContextProvider, TurnOutcome,
+        TurnStreamEvent,
+    };
     use serde_json::json;
     use std::collections::VecDeque;
     use std::future::Future;
@@ -465,12 +521,14 @@ mod tests {
 
     struct MockModel {
         responses: Mutex<VecDeque<ModelResponse>>,
+        requests: Mutex<Vec<ModelRequest>>,
     }
 
     impl MockModel {
         fn new(responses: Vec<ModelResponse>) -> Self {
             Self {
                 responses: Mutex::new(VecDeque::from(responses)),
+                requests: Mutex::new(Vec::new()),
             }
         }
     }
@@ -478,10 +536,11 @@ mod tests {
     impl ModelClient for MockModel {
         fn stream_complete<'a>(
             &'a self,
-            _request: ModelRequest,
+            request: ModelRequest,
             _on_event: &'a mut ModelStreamHandler<'a>,
         ) -> Pin<Box<dyn Future<Output = Result<ModelResponse>> + Send + 'a>> {
             Box::pin(async move {
+                self.requests.lock().expect("requests").push(request);
                 self.responses
                     .lock()
                     .expect("lock")
@@ -594,7 +653,7 @@ mod tests {
             }],
         );
 
-        let request = agent.model_request_from_projection(Default::default());
+        let request = agent.model_request_from_projection(Default::default(), None);
         let Some(crate::projection::ChatMessage::System { content }) = request.messages.first()
         else {
             panic!("missing system message");
@@ -603,6 +662,55 @@ mod tests {
         assert!(content.contains("Current time context: local="));
         assert!(content.contains("utc="));
         assert!(content.contains("time-sensitive answers"));
+    }
+
+    #[tokio::test]
+    async fn runtime_context_is_added_to_system_prompt_not_user_input() {
+        struct DummyRuntimeContextProvider;
+
+        impl RuntimeContextProvider for DummyRuntimeContextProvider {
+            fn context_for_turn(&self, input: RuntimeContextInput<'_>) -> Option<String> {
+                Some(format!(
+                    "<runtime thread=\"{}\">query={}</runtime>",
+                    input.thread_id, input.user_text
+                ))
+            }
+        }
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(JsonFileThreadStore::new(temp.path()));
+        let model = Arc::new(MockModel::new(vec![ModelResponse::AssistantMessage {
+            text: "hello".to_string(),
+        }]));
+        let agent = Agent::new(
+            AgentConfig {
+                runtime_context_provider: Some(Arc::new(DummyRuntimeContextProvider)),
+                ..AgentConfig::default()
+            },
+            store.clone(),
+            model.clone(),
+            builtin_registry(),
+        );
+
+        let outcome = agent.run_turn("thread-a", "coffee shop lights").await;
+        assert!(matches!(outcome, Ok(TurnOutcome::AssistantMessage { .. })));
+
+        let requests = model.requests.lock().expect("requests");
+        let system = requests[0]
+            .messages
+            .iter()
+            .find_map(|message| match message {
+                crate::projection::ChatMessage::System { content } => Some(content),
+                _ => None,
+            })
+            .expect("system message");
+        assert!(system.contains("<runtime thread=\"thread-a\">query=coffee shop lights</runtime>"));
+
+        let thread = store.load("thread-a").await.expect("thread");
+        let TurnItemKind::UserInput { text, .. } = &thread.turns[0].items[0].kind else {
+            panic!("missing user input");
+        };
+        assert_eq!(text, "coffee shop lights");
     }
 
     #[tokio::test]
