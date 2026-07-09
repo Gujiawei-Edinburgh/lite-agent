@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -14,6 +15,8 @@ pub struct Thread {
     pub id: ThreadId,
     pub goal: Option<GoalState>,
     pub turns: Vec<Turn>,
+    #[serde(default)]
+    pub token_usage: TokenUsage,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -25,6 +28,7 @@ impl Thread {
             id: id.into(),
             goal: None,
             turns: Vec::new(),
+            token_usage: TokenUsage::default(),
             created_at: now.clone(),
             updated_at: now,
         }
@@ -36,6 +40,42 @@ impl Thread {
 
     pub fn turn_mut(&mut self, turn_id: &str) -> Option<&mut Turn> {
         self.turns.iter_mut().find(|turn| turn.id == turn_id)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TokenUsage {
+    pub input_tokens: u64,
+    pub cached_input_tokens: u64,
+    pub output_tokens: u64,
+    pub total_tokens: u64,
+}
+
+impl TokenUsage {
+    pub fn is_zero(&self) -> bool {
+        self.input_tokens == 0
+            && self.cached_input_tokens == 0
+            && self.output_tokens == 0
+            && self.total_tokens == 0
+    }
+
+    pub fn add_assign(&mut self, usage: TokenUsage) {
+        self.input_tokens = self.input_tokens.saturating_add(usage.input_tokens);
+        self.cached_input_tokens = self
+            .cached_input_tokens
+            .saturating_add(usage.cached_input_tokens);
+        self.output_tokens = self.output_tokens.saturating_add(usage.output_tokens);
+        self.total_tokens = self.total_tokens.saturating_add(usage.total_tokens);
+    }
+}
+
+impl fmt::Display for TokenUsage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "input={}, cached_input={}, output={}, total={}",
+            self.input_tokens, self.cached_input_tokens, self.output_tokens, self.total_tokens
+        )
     }
 }
 

@@ -1,6 +1,7 @@
 use crate::error::{AgentError, Result};
 use crate::events::{
-    Thread, ToolResult, Turn, TurnId, TurnItem, TurnItemKind, TurnItemSource, TurnStatus,
+    Thread, TokenUsage, ToolResult, Turn, TurnId, TurnItem, TurnItemKind, TurnItemSource,
+    TurnStatus,
 };
 use crate::functions::{FunctionContext, FunctionExecution, FunctionRegistry, ThreadUpdate};
 use crate::model::{ModelClient, ModelRequest, ModelResponse, ModelStreamEvent};
@@ -103,6 +104,9 @@ pub enum TurnStreamEvent {
     },
     TurnFailed {
         error: String,
+    },
+    TurnTokenUsage {
+        usage: TokenUsage,
     },
 }
 
@@ -208,208 +212,208 @@ impl Agent {
             thread_id: thread_id.to_string(),
             turn_id: turn_id.clone(),
         });
+        let mut turn_token_usage = TokenUsage::default();
 
-        for iteration in 0..self.config.max_model_iterations {
-            let session = Session::from_thread(&thread, turn_id.clone());
-            let request = self.model_request_from_projection(
-                session.projection.clone(),
-                runtime_context.as_deref(),
-            );
-            on_event(TurnStreamEvent::ModelRequestStarted { iteration });
-            let mut model_event_handler = |event| match event {
-                ModelStreamEvent::AssistantDelta { text } => {
-                    on_event(TurnStreamEvent::ModelMessageDelta { text });
-                }
-            };
-            let response = self
-                .model_client
-                .stream_complete(request, &mut model_event_handler)
-                .await;
-            let response = match response {
-                Ok(response) => response,
-                Err(error) => {
-                    let error = error.to_string();
-                    tracing::error!(error, "turn failed during model request");
-                    self.fail_turn(&mut thread, &session.active_turn_id, error.clone())?;
-                    self.store.save(thread).await?;
-                    on_event(TurnStreamEvent::TurnFailed {
-                        error: error.clone(),
-                    });
-                    let outcome = TurnOutcome::Failed { error };
-                    on_event(TurnStreamEvent::TurnCompleted {
-                        outcome: outcome.clone(),
-                    });
-                    return Ok(outcome);
-                }
-            };
-
-            match response {
-                ModelResponse::AssistantMessage { text } => {
-                    on_event(TurnStreamEvent::ModelMessage { text: text.clone() });
-                    Self::push_turn_items(
-                        &mut thread,
-                        &session.active_turn_id,
-                        vec![TurnItem::new(
-                            TurnItemSource::Model,
-                            TurnItemKind::ModelMessage { text: text.clone() },
-                        )],
-                    )?;
-                    Self::set_turn_status(
-                        &mut thread,
-                        &session.active_turn_id,
-                        TurnStatus::Completed,
-                    )?;
-                    self.store.save(thread).await?;
-                    let outcome = TurnOutcome::AssistantMessage { text };
-                    on_event(TurnStreamEvent::TurnCompleted {
-                        outcome: outcome.clone(),
-                    });
-                    return Ok(outcome);
-                }
-                ModelResponse::FunctionCalls { calls } => {
-                    if calls.is_empty() {
-                        let error = "model returned an empty function call list".to_string();
-                        tracing::warn!(error, "empty function call list");
-                        self.fail_turn(&mut thread, &session.active_turn_id, error.clone())?;
-                        self.store.save(thread).await?;
-                        on_event(TurnStreamEvent::TurnFailed {
-                            error: error.clone(),
-                        });
-                        let outcome = TurnOutcome::Failed { error };
-                        on_event(TurnStreamEvent::TurnCompleted {
-                            outcome: outcome.clone(),
-                        });
-                        return Ok(outcome);
+        let outcome = 'turn_loop: loop {
+            for iteration in 0..self.config.max_model_iterations {
+                let session = Session::from_thread(&thread, turn_id.clone());
+                let request = self.model_request_from_projection(
+                    session.projection.clone(),
+                    runtime_context.as_deref(),
+                );
+                on_event(TurnStreamEvent::ModelRequestStarted { iteration });
+                let mut model_event_handler = |event| match event {
+                    ModelStreamEvent::AssistantDelta { text } => {
+                        on_event(TurnStreamEvent::ModelMessageDelta { text });
                     }
+                    ModelStreamEvent::TokenUsage { usage } => {
+                        turn_token_usage.add_assign(usage);
+                    }
+                };
+                let response = self
+                    .model_client
+                    .stream_complete(request, &mut model_event_handler)
+                    .await;
+                let response = match response {
+                    Ok(response) => response,
+                    Err(error) => {
+                        let error = error.to_string();
+                        tracing::error!(error, "turn failed during model request");
+                        self.fail_turn(&mut thread, &session.active_turn_id, error.clone())?;
+                        break 'turn_loop TurnOutcome::Failed { error };
+                    }
+                };
 
-                    on_event(TurnStreamEvent::FunctionCallsRequested {
-                        calls: calls.clone(),
-                    });
-                    let call_items = calls
-                        .iter()
-                        .map(|call| {
-                            TurnItem::new(
+                match response {
+                    ModelResponse::AssistantMessage { text } => {
+                        on_event(TurnStreamEvent::ModelMessage { text: text.clone() });
+                        Self::push_turn_items(
+                            &mut thread,
+                            &session.active_turn_id,
+                            vec![TurnItem::new(
                                 TurnItemSource::Model,
-                                TurnItemKind::ModelFunctionCall {
-                                    call_id: call.call_id.clone(),
-                                    name: call.name.clone(),
-                                    arguments: call.arguments.clone(),
-                                },
-                            )
-                        })
-                        .collect();
-                    Self::push_turn_items(&mut thread, &session.active_turn_id, call_items)?;
-                    thread = self.store.save(thread).await?;
+                                TurnItemKind::ModelMessage { text: text.clone() },
+                            )],
+                        )?;
+                        Self::set_turn_status(
+                            &mut thread,
+                            &session.active_turn_id,
+                            TurnStatus::Completed,
+                        )?;
+                        break 'turn_loop TurnOutcome::AssistantMessage { text };
+                    }
+                    ModelResponse::FunctionCalls { calls } => {
+                        if calls.is_empty() {
+                            let error = "model returned an empty function call list".to_string();
+                            tracing::warn!(error, "empty function call list");
+                            self.fail_turn(&mut thread, &session.active_turn_id, error.clone())?;
+                            break 'turn_loop TurnOutcome::Failed { error };
+                        }
 
-                    for call in calls {
-                        let call_id = call.call_id.clone();
-                        let name = call.name.clone();
-                        on_event(TurnStreamEvent::FunctionStarted {
-                            call_id: call_id.clone(),
-                            name: name.clone(),
+                        on_event(TurnStreamEvent::FunctionCallsRequested {
+                            calls: calls.clone(),
                         });
-                        let context = FunctionContext {
-                            projection: ThreadProjection::from_thread(&thread),
-                        };
-                        let execution = self
-                            .function_registry
-                            .call(&call.name, call.arguments.clone(), context)
-                            .await;
+                        let call_items = calls
+                            .iter()
+                            .map(|call| {
+                                TurnItem::new(
+                                    TurnItemSource::Model,
+                                    TurnItemKind::ModelFunctionCall {
+                                        call_id: call.call_id.clone(),
+                                        name: call.name.clone(),
+                                        arguments: call.arguments.clone(),
+                                    },
+                                )
+                            })
+                            .collect();
+                        Self::push_turn_items(&mut thread, &session.active_turn_id, call_items)?;
+                        thread = self.store.save(thread).await?;
 
-                        match execution {
-                            Ok(FunctionExecution::Completed {
-                                output,
-                                thread_update,
-                                mut extra_items,
-                            }) => {
-                                Self::apply_thread_update(&mut thread, thread_update);
-                                extra_items.push(TurnItem::new(
-                                    TurnItemSource::Tool,
-                                    TurnItemKind::ToolOutput {
-                                        call_id: call_id.clone(),
-                                        name: name.clone(),
-                                        result: ToolResult::Success { output },
-                                    },
-                                ));
-                                Self::push_turn_items(&mut thread, &turn_id, extra_items)?;
-                                thread = self.store.save(thread).await?;
-                                on_event(TurnStreamEvent::FunctionCompleted { call_id, name });
-                            }
-                            Ok(FunctionExecution::WaitingForUser {
-                                request_id,
-                                prompt,
-                                output,
-                                thread_update,
-                                mut extra_items,
-                            }) => {
-                                Self::apply_thread_update(&mut thread, thread_update);
-                                extra_items.push(TurnItem::new(
-                                    TurnItemSource::Tool,
-                                    TurnItemKind::ToolOutput {
-                                        call_id: call_id.clone(),
-                                        name: name.clone(),
-                                        result: ToolResult::Success { output },
-                                    },
-                                ));
-                                Self::push_turn_items(&mut thread, &turn_id, extra_items)?;
-                                Self::set_turn_status(
-                                    &mut thread,
-                                    &turn_id,
-                                    TurnStatus::WaitingForUser,
-                                )?;
-                                self.store.save(thread).await?;
-                                on_event(TurnStreamEvent::FunctionCompleted { call_id, name });
-                                on_event(TurnStreamEvent::WaitingForUser {
-                                    request_id: request_id.clone(),
-                                    prompt: prompt.clone(),
-                                });
-                                let outcome = TurnOutcome::WaitingForUser { request_id, prompt };
-                                on_event(TurnStreamEvent::TurnCompleted {
-                                    outcome: outcome.clone(),
-                                });
-                                return Ok(outcome);
-                            }
-                            Err(error) => {
-                                let error_text = error.to_string();
-                                Self::push_turn_items(
-                                    &mut thread,
-                                    &turn_id,
-                                    vec![TurnItem::new(
+                        for call in calls {
+                            let call_id = call.call_id.clone();
+                            let name = call.name.clone();
+                            on_event(TurnStreamEvent::FunctionStarted {
+                                call_id: call_id.clone(),
+                                name: name.clone(),
+                            });
+                            let context = FunctionContext {
+                                projection: ThreadProjection::from_thread(&thread),
+                            };
+                            let execution = self
+                                .function_registry
+                                .call(&call.name, call.arguments.clone(), context)
+                                .await;
+
+                            match execution {
+                                Ok(FunctionExecution::Completed {
+                                    output,
+                                    thread_update,
+                                    mut extra_items,
+                                }) => {
+                                    Self::apply_thread_update(&mut thread, thread_update);
+                                    extra_items.push(TurnItem::new(
                                         TurnItemSource::Tool,
                                         TurnItemKind::ToolOutput {
                                             call_id: call_id.clone(),
                                             name: name.clone(),
-                                            result: ToolResult::Error {
-                                                error: error_text.clone(),
-                                            },
+                                            result: ToolResult::Success { output },
                                         },
-                                    )],
-                                )?;
-                                thread = self.store.save(thread).await?;
-                                on_event(TurnStreamEvent::FunctionFailed {
-                                    call_id,
-                                    name,
-                                    error: error_text,
-                                });
+                                    ));
+                                    Self::push_turn_items(&mut thread, &turn_id, extra_items)?;
+                                    thread = self.store.save(thread).await?;
+                                    on_event(TurnStreamEvent::FunctionCompleted { call_id, name });
+                                }
+                                Ok(FunctionExecution::WaitingForUser {
+                                    request_id,
+                                    prompt,
+                                    output,
+                                    thread_update,
+                                    mut extra_items,
+                                }) => {
+                                    Self::apply_thread_update(&mut thread, thread_update);
+                                    extra_items.push(TurnItem::new(
+                                        TurnItemSource::Tool,
+                                        TurnItemKind::ToolOutput {
+                                            call_id: call_id.clone(),
+                                            name: name.clone(),
+                                            result: ToolResult::Success { output },
+                                        },
+                                    ));
+                                    Self::push_turn_items(&mut thread, &turn_id, extra_items)?;
+                                    Self::set_turn_status(
+                                        &mut thread,
+                                        &turn_id,
+                                        TurnStatus::WaitingForUser,
+                                    )?;
+                                    on_event(TurnStreamEvent::FunctionCompleted { call_id, name });
+                                    on_event(TurnStreamEvent::WaitingForUser {
+                                        request_id: request_id.clone(),
+                                        prompt: prompt.clone(),
+                                    });
+                                    break 'turn_loop TurnOutcome::WaitingForUser {
+                                        request_id,
+                                        prompt,
+                                    };
+                                }
+                                Err(error) => {
+                                    let error_text = error.to_string();
+                                    Self::push_turn_items(
+                                        &mut thread,
+                                        &turn_id,
+                                        vec![TurnItem::new(
+                                            TurnItemSource::Tool,
+                                            TurnItemKind::ToolOutput {
+                                                call_id: call_id.clone(),
+                                                name: name.clone(),
+                                                result: ToolResult::Error {
+                                                    error: error_text.clone(),
+                                                },
+                                            },
+                                        )],
+                                    )?;
+                                    thread = self.store.save(thread).await?;
+                                    on_event(TurnStreamEvent::FunctionFailed {
+                                        call_id,
+                                        name,
+                                        error: error_text,
+                                    });
+                                }
                             }
                         }
                     }
                 }
             }
-        }
 
-        let error = AgentError::MaxIterations(self.config.max_model_iterations).to_string();
-        tracing::warn!(error, "turn exceeded max iterations");
-        self.fail_turn(&mut thread, &turn_id, error.clone())?;
+            let error = AgentError::MaxIterations(self.config.max_model_iterations).to_string();
+            tracing::warn!(error, "turn exceeded max iterations");
+            self.fail_turn(&mut thread, &turn_id, error.clone())?;
+            break 'turn_loop TurnOutcome::Failed { error };
+        };
+
+        Self::apply_turn_token_usage(&mut thread, turn_token_usage);
         self.store.save(thread).await?;
-        on_event(TurnStreamEvent::TurnFailed {
-            error: error.clone(),
-        });
-        let outcome = TurnOutcome::Failed { error };
+        if let TurnOutcome::Failed { error } = &outcome {
+            on_event(TurnStreamEvent::TurnFailed {
+                error: error.clone(),
+            });
+        }
+        Self::emit_turn_token_usage(&mut on_event, turn_token_usage);
         on_event(TurnStreamEvent::TurnCompleted {
             outcome: outcome.clone(),
         });
         Ok(outcome)
+    }
+
+    fn apply_turn_token_usage(thread: &mut Thread, usage: TokenUsage) {
+        if !usage.is_zero() {
+            thread.token_usage.add_assign(usage);
+        }
+    }
+
+    fn emit_turn_token_usage(on_event: &mut TurnEventHandler<'_>, usage: TokenUsage) {
+        if !usage.is_zero() {
+            on_event(TurnStreamEvent::TurnTokenUsage { usage });
+        }
     }
 
     async fn acquire_session_lock(&self, thread_id: &str) -> OwnedMutexGuard<()> {
@@ -501,10 +505,11 @@ impl Agent {
 
 #[cfg(test)]
 mod tests {
-    use crate::events::{ToolResult, TurnItemKind, TurnStatus};
+    use crate::events::{TokenUsage, ToolResult, TurnItemKind, TurnStatus};
     use crate::functions::builtin_registry;
     use crate::model::{
-        ModelClient, ModelFunctionCall, ModelRequest, ModelResponse, ModelStreamHandler,
+        ModelClient, ModelFunctionCall, ModelRequest, ModelResponse, ModelStreamEvent,
+        ModelStreamHandler,
     };
     use crate::store::{JsonFileThreadStore, ThreadStore};
     use crate::{
@@ -755,6 +760,68 @@ mod tests {
         assert!(events
             .iter()
             .any(|event| matches!(event, TurnStreamEvent::TurnCompleted { .. })));
+    }
+
+    #[tokio::test]
+    async fn turn_token_usage_is_emitted_and_persisted_on_thread() {
+        struct UsageModel;
+
+        impl ModelClient for UsageModel {
+            fn stream_complete<'a>(
+                &'a self,
+                _request: ModelRequest,
+                on_event: &'a mut ModelStreamHandler<'a>,
+            ) -> Pin<Box<dyn Future<Output = Result<ModelResponse>> + Send + 'a>> {
+                Box::pin(async move {
+                    on_event(ModelStreamEvent::TokenUsage {
+                        usage: TokenUsage {
+                            input_tokens: 10,
+                            cached_input_tokens: 2,
+                            output_tokens: 4,
+                            total_tokens: 14,
+                        },
+                    });
+                    Ok(ModelResponse::AssistantMessage {
+                        text: "done".to_string(),
+                    })
+                })
+            }
+        }
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(JsonFileThreadStore::new(temp.path()));
+        let agent = Agent::new(
+            AgentConfig::default(),
+            store.clone(),
+            Arc::new(UsageModel),
+            builtin_registry(),
+        );
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let captured = events.clone();
+
+        let outcome = agent
+            .run_turn_stream("t", "usage?", move |event| {
+                captured.lock().expect("lock").push(event);
+            })
+            .await
+            .expect("turn");
+
+        assert!(matches!(outcome, TurnOutcome::AssistantMessage { .. }));
+        let events = events.lock().expect("lock");
+        let usage = events
+            .iter()
+            .find_map(|event| match event {
+                TurnStreamEvent::TurnTokenUsage { usage } => Some(*usage),
+                _ => None,
+            })
+            .expect("usage event");
+        assert_eq!(usage.input_tokens, 10);
+        assert_eq!(usage.cached_input_tokens, 2);
+        assert_eq!(usage.output_tokens, 4);
+        assert_eq!(usage.total_tokens, 14);
+
+        let thread = store.load("t").await.expect("thread");
+        assert_eq!(thread.token_usage, usage);
     }
 
     #[tokio::test]

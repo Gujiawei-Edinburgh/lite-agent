@@ -1,4 +1,5 @@
 use crate::error::{AgentError, Result};
+use crate::events::TokenUsage;
 use crate::projection::ChatMessage;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -50,6 +51,7 @@ pub struct ModelFunctionCall {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ModelStreamEvent {
     AssistantDelta { text: String },
+    TokenUsage { usage: TokenUsage },
 }
 
 pub type ModelStreamHandler<'a> = dyn FnMut(ModelStreamEvent) + Send + 'a;
@@ -152,6 +154,8 @@ struct OpenAiChatRequest {
     tools: Vec<OpenAiTool>,
     tool_choice: &'static str,
     stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream_options: Option<OpenAiStreamOptions>,
 }
 
 impl OpenAiChatRequest {
@@ -179,8 +183,16 @@ impl OpenAiChatRequest {
                 .collect(),
             tool_choice: "auto",
             stream,
+            stream_options: stream.then_some(OpenAiStreamOptions {
+                include_usage: true,
+            }),
         }
     }
+}
+
+#[derive(Debug, Serialize)]
+struct OpenAiStreamOptions {
+    include_usage: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -332,6 +344,9 @@ async fn handle_sse_frame(
             continue;
         }
         let event: OpenAiChatStreamResponse = serde_json::from_str(data)?;
+        if let Some(usage) = event.usage.and_then(OpenAiUsage::into_token_usage) {
+            on_event(ModelStreamEvent::TokenUsage { usage });
+        }
         for choice in event.choices {
             if let Some(content) = choice.delta.content {
                 assistant_text.push_str(&content);
@@ -352,7 +367,48 @@ async fn handle_sse_frame(
 
 #[derive(Debug, Deserialize)]
 struct OpenAiChatStreamResponse {
+    #[serde(default)]
     choices: Vec<OpenAiStreamChoice>,
+    usage: Option<OpenAiUsage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiUsage {
+    prompt_tokens: Option<u64>,
+    completion_tokens: Option<u64>,
+    total_tokens: Option<u64>,
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+    prompt_tokens_details: Option<OpenAiPromptTokensDetails>,
+}
+
+impl OpenAiUsage {
+    fn into_token_usage(self) -> Option<TokenUsage> {
+        let input_tokens = self.input_tokens.or(self.prompt_tokens).unwrap_or_default();
+        let output_tokens = self
+            .output_tokens
+            .or(self.completion_tokens)
+            .unwrap_or_default();
+        let total_tokens = self
+            .total_tokens
+            .unwrap_or_else(|| input_tokens.saturating_add(output_tokens));
+        let cached_input_tokens = self
+            .prompt_tokens_details
+            .and_then(|details| details.cached_tokens)
+            .unwrap_or_default();
+        let usage = TokenUsage {
+            input_tokens,
+            cached_input_tokens,
+            output_tokens,
+            total_tokens,
+        };
+        (!usage.is_zero()).then_some(usage)
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiPromptTokensDetails {
+    cached_tokens: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -381,7 +437,7 @@ struct OpenAiStreamFunctionDelta {
 
 #[cfg(test)]
 mod tests {
-    use super::{handle_sse_frame, PartialToolCall};
+    use super::{handle_sse_frame, ModelStreamEvent, PartialToolCall};
     use super::{FunctionSpec, ModelFunctionCall, ModelRequest, OpenAiChatRequest};
     use crate::projection::ChatMessage;
     use serde_json::{json, Value};
@@ -473,5 +529,32 @@ data: [DONE]
         assert_eq!(call.call_id, "call_1");
         assert_eq!(call.name, "exec_command");
         assert_eq!(call.arguments, json!({ "cmd": "ls" }));
+    }
+
+    #[tokio::test]
+    async fn parses_streaming_usage_event() {
+        let mut text = String::new();
+        let mut calls = BTreeMap::<usize, PartialToolCall>::new();
+        let mut events = Vec::new();
+        let frame = r#"data: {"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":4,"total_tokens":14,"prompt_tokens_details":{"cached_tokens":3}}}
+
+data: [DONE]
+
+"#;
+
+        handle_sse_frame(frame, &mut text, &mut calls, &mut |event| {
+            events.push(event);
+        })
+        .await
+        .expect("frame");
+
+        assert_eq!(events.len(), 1);
+        let ModelStreamEvent::TokenUsage { usage } = events[0].clone() else {
+            panic!("missing usage event");
+        };
+        assert_eq!(usage.input_tokens, 10);
+        assert_eq!(usage.cached_input_tokens, 3);
+        assert_eq!(usage.output_tokens, 4);
+        assert_eq!(usage.total_tokens, 14);
     }
 }

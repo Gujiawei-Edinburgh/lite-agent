@@ -340,6 +340,7 @@ fn print_stream_event(event: TurnStreamEvent, state: &mut StreamRenderState) {
                 let _ = std_io::stdout().flush();
             }
         }
+        TurnStreamEvent::TurnTokenUsage { usage } => {println!("{}", usage.total_tokens)}
         TurnStreamEvent::ModelMessage { .. } | TurnStreamEvent::TurnCompleted { .. } => {}
     }
 }

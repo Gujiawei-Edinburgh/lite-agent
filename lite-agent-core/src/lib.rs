@@ -12,8 +12,8 @@ pub use agent_loop::{
 };
 pub use error::{AgentError, Result};
 pub use events::{
-    GoalState, GoalStatus, Thread, ThreadId, ToolResult, Turn, TurnId, TurnItem, TurnItemId,
-    TurnItemKind, TurnItemSource, TurnStatus,
+    GoalState, GoalStatus, Thread, ThreadId, TokenUsage, ToolResult, Turn, TurnId, TurnItem,
+    TurnItemId, TurnItemKind, TurnItemSource, TurnStatus,
 };
 pub use functions::{
     builtin_registry, AgentFunction, FunctionContext, FunctionExecution, FunctionRegistry,

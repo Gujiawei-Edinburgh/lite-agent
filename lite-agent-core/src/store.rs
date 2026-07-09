@@ -176,11 +176,8 @@ mod tests {
 
         store
             .save(Thread {
-                id: "t1".to_string(),
-                goal: None,
                 turns: vec![turn],
-                created_at: "1".to_string(),
-                updated_at: "1".to_string(),
+                ..Thread::new("t1")
             })
             .await
             .expect("save");
