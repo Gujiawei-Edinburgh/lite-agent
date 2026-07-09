@@ -10,6 +10,8 @@ use crate::store::ThreadStore;
 use chrono::{Local, Utc};
 use serde_json::Value;
 use std::collections::BTreeMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
@@ -126,6 +128,50 @@ pub struct RuntimeEvent {
 pub type TurnEventHandler<'a> = dyn FnMut(TurnStreamEvent) + Send + 'a;
 
 #[derive(Debug, Clone)]
+pub struct FunctionCallHookContext {
+    pub thread_id: String,
+    pub turn_id: TurnId,
+    pub call_id: String,
+    pub name: String,
+    pub arguments: Value,
+    pub projection: ThreadProjection,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum FunctionCallHookResult {
+    Completed {
+        output: Value,
+    },
+    WaitingForUser {
+        request_id: String,
+        prompt: String,
+        output: Value,
+    },
+    Failed {
+        error: String,
+    },
+}
+
+pub trait FunctionCallHook: Send + Sync {
+    fn before_call<'a>(
+        &'a self,
+        _context: FunctionCallHookContext,
+        _emit: &'a mut TurnEventHandler<'a>,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn after_call<'a>(
+        &'a self,
+        _context: FunctionCallHookContext,
+        _result: FunctionCallHookResult,
+        _emit: &'a mut TurnEventHandler<'a>,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+#[derive(Debug, Clone)]
 struct Session {
     _thread_id: String,
     active_turn_id: TurnId,
@@ -148,6 +194,7 @@ pub struct Agent {
     store: Arc<dyn ThreadStore>,
     model_client: Arc<dyn ModelClient>,
     function_registry: FunctionRegistry,
+    function_call_hooks: Vec<Arc<dyn FunctionCallHook>>,
     session_locks: Arc<AsyncMutex<BTreeMap<String, Arc<AsyncMutex<()>>>>>,
 }
 
@@ -163,8 +210,22 @@ impl Agent {
             store,
             model_client,
             function_registry,
+            function_call_hooks: Vec::new(),
             session_locks: Arc::new(AsyncMutex::new(BTreeMap::new())),
         }
+    }
+
+    pub fn with_function_call_hook<H>(mut self, hook: H) -> Self
+    where
+        H: FunctionCallHook + 'static,
+    {
+        self.function_call_hooks.push(Arc::new(hook));
+        self
+    }
+
+    pub fn with_function_call_hooks(mut self, hooks: Vec<Arc<dyn FunctionCallHook>>) -> Self {
+        self.function_call_hooks.extend(hooks);
+        self
     }
 
     pub async fn run_turn(
@@ -317,13 +378,27 @@ impl Agent {
                                 call_id: call_id.clone(),
                                 name: name.clone(),
                             }));
-                            let context = FunctionContext {
-                                projection: ThreadProjection::from_thread(&thread),
+                            let projection = ThreadProjection::from_thread(&thread);
+                            let hook_context = FunctionCallHookContext {
+                                thread_id: thread.id.clone(),
+                                turn_id: turn_id.clone(),
+                                call_id: call_id.clone(),
+                                name: name.clone(),
+                                arguments: call.arguments.clone(),
+                                projection: projection.clone(),
                             };
-                            let execution = self
-                                .function_registry
-                                .call(&call.name, call.arguments.clone(), context)
+                            let pre_hook_result = self
+                                .run_before_function_call_hooks(hook_context.clone(), &mut on_event)
                                 .await;
+                            let execution = match pre_hook_result {
+                                Ok(()) => {
+                                    let context = FunctionContext { projection };
+                                    self.function_registry
+                                        .call(&call.name, call.arguments.clone(), context)
+                                        .await
+                                }
+                                Err(error) => Err(error),
+                            };
 
                             match execution {
                                 Ok(FunctionExecution::Completed {
@@ -332,6 +407,9 @@ impl Agent {
                                     mut extra_items,
                                 }) => {
                                     Self::apply_thread_update(&mut thread, thread_update);
+                                    let hook_result = FunctionCallHookResult::Completed {
+                                        output: output.clone(),
+                                    };
                                     extra_items.push(TurnItem::new(
                                         TurnItemSource::Tool,
                                         TurnItemKind::ToolOutput {
@@ -342,6 +420,12 @@ impl Agent {
                                     ));
                                     Self::push_turn_items(&mut thread, &turn_id, extra_items)?;
                                     thread = self.store.save(thread).await?;
+                                    self.run_after_function_call_hooks(
+                                        hook_context,
+                                        hook_result,
+                                        &mut on_event,
+                                    )
+                                    .await;
                                     on_event(TurnStreamEvent::State(
                                         TurnStateEvent::FunctionCompleted { call_id, name },
                                     ));
@@ -354,6 +438,11 @@ impl Agent {
                                     mut extra_items,
                                 }) => {
                                     Self::apply_thread_update(&mut thread, thread_update);
+                                    let hook_result = FunctionCallHookResult::WaitingForUser {
+                                        request_id: request_id.clone(),
+                                        prompt: prompt.clone(),
+                                        output: output.clone(),
+                                    };
                                     extra_items.push(TurnItem::new(
                                         TurnItemSource::Tool,
                                         TurnItemKind::ToolOutput {
@@ -368,6 +457,12 @@ impl Agent {
                                         &turn_id,
                                         TurnStatus::WaitingForUser,
                                     )?;
+                                    self.run_after_function_call_hooks(
+                                        hook_context,
+                                        hook_result,
+                                        &mut on_event,
+                                    )
+                                    .await;
                                     on_event(TurnStreamEvent::State(
                                         TurnStateEvent::FunctionCompleted { call_id, name },
                                     ));
@@ -384,6 +479,9 @@ impl Agent {
                                 }
                                 Err(error) => {
                                     let error_text = error.to_string();
+                                    let hook_result = FunctionCallHookResult::Failed {
+                                        error: error_text.clone(),
+                                    };
                                     Self::push_turn_items(
                                         &mut thread,
                                         &turn_id,
@@ -399,6 +497,12 @@ impl Agent {
                                         )],
                                     )?;
                                     thread = self.store.save(thread).await?;
+                                    self.run_after_function_call_hooks(
+                                        hook_context,
+                                        hook_result,
+                                        &mut on_event,
+                                    )
+                                    .await;
                                     on_event(TurnStreamEvent::State(
                                         TurnStateEvent::FunctionFailed {
                                             call_id,
@@ -444,6 +548,42 @@ impl Agent {
             on_event(TurnStreamEvent::State(TurnStateEvent::TurnTokenUsage {
                 usage,
             }));
+        }
+    }
+
+    async fn run_before_function_call_hooks(
+        &self,
+        context: FunctionCallHookContext,
+        on_event: &mut TurnEventHandler<'_>,
+    ) -> Result<()> {
+        for hook in &self.function_call_hooks {
+            hook.before_call(context.clone(), on_event).await?;
+        }
+        Ok(())
+    }
+
+    async fn run_after_function_call_hooks(
+        &self,
+        context: FunctionCallHookContext,
+        result: FunctionCallHookResult,
+        on_event: &mut TurnEventHandler<'_>,
+    ) {
+        for hook in &self.function_call_hooks {
+            if let Err(error) = hook
+                .after_call(context.clone(), result.clone(), on_event)
+                .await
+            {
+                tracing::warn!(error = %error, "function call post-hook failed");
+                on_event(TurnStreamEvent::Runtime(RuntimeEvent {
+                    source: "function_call_hook".to_string(),
+                    message: "post-hook failed".to_string(),
+                    metadata: serde_json::json!({
+                        "call_id": context.call_id,
+                        "name": context.name,
+                        "error": error.to_string(),
+                    }),
+                }));
+            }
         }
     }
 
@@ -544,8 +684,9 @@ mod tests {
     };
     use crate::store::{JsonFileThreadStore, ThreadStore};
     use crate::{
-        Agent, AgentConfig, Result, RuntimeContextInput, RuntimeContextProvider, TurnOutcome,
-        TurnStateEvent, TurnStreamEvent,
+        Agent, AgentConfig, AgentError, FunctionCallHook, FunctionCallHookContext,
+        FunctionCallHookResult, Result, RuntimeContextInput, RuntimeContextProvider, RuntimeEvent,
+        TurnOutcome, TurnStateEvent, TurnStreamEvent,
     };
     use serde_json::json;
     use std::collections::VecDeque;
@@ -622,6 +763,87 @@ mod tests {
             Arc::new(MockModel::new(responses)),
             builtin_registry(),
         )
+    }
+
+    struct RecordingHook {
+        label: &'static str,
+        events: Arc<Mutex<Vec<String>>>,
+        fail_before: bool,
+        fail_after: bool,
+    }
+
+    impl RecordingHook {
+        fn new(label: &'static str, events: Arc<Mutex<Vec<String>>>) -> Self {
+            Self {
+                label,
+                events,
+                fail_before: false,
+                fail_after: false,
+            }
+        }
+
+        fn fail_before(mut self) -> Self {
+            self.fail_before = true;
+            self
+        }
+
+        fn fail_after(mut self) -> Self {
+            self.fail_after = true;
+            self
+        }
+    }
+
+    impl FunctionCallHook for RecordingHook {
+        fn before_call<'a>(
+            &'a self,
+            context: FunctionCallHookContext,
+            emit: &'a mut super::TurnEventHandler<'a>,
+        ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+            Box::pin(async move {
+                self.events
+                    .lock()
+                    .expect("events")
+                    .push(format!("before:{}:{}", self.label, context.name));
+                emit(TurnStreamEvent::Runtime(RuntimeEvent {
+                    source: self.label.to_string(),
+                    message: "before".to_string(),
+                    metadata: json!({ "name": context.name }),
+                }));
+                if self.fail_before {
+                    return Err(AgentError::Function {
+                        name: context.name,
+                        message: format!("{} blocked call", self.label),
+                    });
+                }
+                Ok(())
+            })
+        }
+
+        fn after_call<'a>(
+            &'a self,
+            context: FunctionCallHookContext,
+            result: FunctionCallHookResult,
+            _emit: &'a mut super::TurnEventHandler<'a>,
+        ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+            Box::pin(async move {
+                let result_label = match result {
+                    FunctionCallHookResult::Completed { .. } => "completed",
+                    FunctionCallHookResult::WaitingForUser { .. } => "waiting",
+                    FunctionCallHookResult::Failed { .. } => "failed",
+                };
+                self.events.lock().expect("events").push(format!(
+                    "after:{}:{}:{result_label}",
+                    self.label, context.name
+                ));
+                if self.fail_after {
+                    return Err(AgentError::Function {
+                        name: context.name,
+                        message: format!("{} post-hook failed", self.label),
+                    });
+                }
+                Ok(())
+            })
+        }
     }
 
     #[tokio::test]
@@ -947,6 +1169,150 @@ mod tests {
             &item.kind,
             TurnItemKind::ToolOutput {
                 result: ToolResult::Error { .. },
+                ..
+            }
+        )));
+    }
+
+    #[tokio::test]
+    async fn function_call_hooks_are_stacked_in_order() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(JsonFileThreadStore::new(temp.path()));
+        let hook_events = Arc::new(Mutex::new(Vec::new()));
+        let agent = agent_with(
+            store,
+            vec![
+                ModelResponse::FunctionCalls {
+                    calls: vec![ModelFunctionCall {
+                        call_id: "c1".to_string(),
+                        name: "get_goal".to_string(),
+                        arguments: json!({}),
+                    }],
+                },
+                ModelResponse::AssistantMessage {
+                    text: "done".to_string(),
+                },
+            ],
+        )
+        .with_function_call_hook(RecordingHook::new("a", hook_events.clone()))
+        .with_function_call_hook(RecordingHook::new("b", hook_events.clone()));
+
+        let outcome = agent.run_turn("t", "goal?").await.expect("turn");
+        assert!(matches!(outcome, TurnOutcome::AssistantMessage { .. }));
+
+        assert_eq!(
+            *hook_events.lock().expect("events"),
+            vec![
+                "before:a:get_goal",
+                "before:b:get_goal",
+                "after:a:get_goal:completed",
+                "after:b:get_goal:completed",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_hook_failure_blocks_function_and_records_tool_error() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(JsonFileThreadStore::new(temp.path()));
+        let hook_events = Arc::new(Mutex::new(Vec::new()));
+        let agent = agent_with(
+            store.clone(),
+            vec![
+                ModelResponse::FunctionCalls {
+                    calls: vec![ModelFunctionCall {
+                        call_id: "c1".to_string(),
+                        name: "get_goal".to_string(),
+                        arguments: json!({}),
+                    }],
+                },
+                ModelResponse::AssistantMessage {
+                    text: "blocked".to_string(),
+                },
+            ],
+        )
+        .with_function_call_hook(RecordingHook::new("policy", hook_events.clone()).fail_before());
+
+        let outcome = agent.run_turn("t", "goal?").await.expect("turn");
+        assert!(matches!(outcome, TurnOutcome::AssistantMessage { .. }));
+        assert_eq!(
+            *hook_events.lock().expect("events"),
+            vec!["before:policy:get_goal", "after:policy:get_goal:failed"]
+        );
+
+        let thread = store.load("t").await.expect("thread");
+        let tool_outputs = thread.turns[0]
+            .items
+            .iter()
+            .filter(|item| matches!(item.kind, TurnItemKind::ToolOutput { .. }))
+            .count();
+        assert_eq!(tool_outputs, 1);
+        assert!(thread.turns[0].items.iter().any(|item| matches!(
+            &item.kind,
+            TurnItemKind::ToolOutput {
+                call_id,
+                name,
+                result: ToolResult::Error { error },
+            } if call_id == "c1"
+                && name == "get_goal"
+                && error.contains("policy blocked call")
+        )));
+    }
+
+    #[tokio::test]
+    async fn post_hook_failure_is_non_blocking_runtime_event() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(JsonFileThreadStore::new(temp.path()));
+        let hook_events = Arc::new(Mutex::new(Vec::new()));
+        let agent = agent_with(
+            store.clone(),
+            vec![
+                ModelResponse::FunctionCalls {
+                    calls: vec![ModelFunctionCall {
+                        call_id: "c1".to_string(),
+                        name: "get_goal".to_string(),
+                        arguments: json!({}),
+                    }],
+                },
+                ModelResponse::AssistantMessage {
+                    text: "done".to_string(),
+                },
+            ],
+        )
+        .with_function_call_hook(RecordingHook::new("audit", hook_events.clone()).fail_after());
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let captured = events.clone();
+
+        let outcome = agent
+            .run_turn_stream("t", "goal?", move |event| {
+                captured.lock().expect("events").push(event);
+            })
+            .await
+            .expect("turn");
+
+        assert_eq!(
+            outcome,
+            TurnOutcome::AssistantMessage {
+                text: "done".to_string()
+            }
+        );
+        assert_eq!(
+            *hook_events.lock().expect("events"),
+            vec!["before:audit:get_goal", "after:audit:get_goal:completed"]
+        );
+        assert!(events.lock().expect("events").iter().any(|event| matches!(
+            event,
+            TurnStreamEvent::Runtime(RuntimeEvent { source, message, metadata })
+                if source == "function_call_hook"
+                    && message == "post-hook failed"
+                    && metadata["name"] == "get_goal"
+        )));
+
+        let thread = store.load("t").await.expect("thread");
+        assert!(thread.turns[0].items.iter().any(|item| matches!(
+            &item.kind,
+            TurnItemKind::ToolOutput {
+                result: ToolResult::Success { .. },
                 ..
             }
         )));
