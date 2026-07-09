@@ -8,6 +8,7 @@ use crate::model::{ModelClient, ModelRequest, ModelResponse, ModelStreamEvent};
 use crate::projection::{ChatMessage, ThreadProjection};
 use crate::store::ThreadStore;
 use chrono::{Local, Utc};
+use serde_json::Value;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
@@ -66,18 +67,16 @@ pub enum TurnOutcome {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum TurnStreamEvent {
+    State(TurnStateEvent),
+    Model(TurnModelEvent),
+    Runtime(RuntimeEvent),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum TurnStateEvent {
     TurnStarted {
         thread_id: String,
         turn_id: TurnId,
-    },
-    ModelRequestStarted {
-        iteration: usize,
-    },
-    ModelMessage {
-        text: String,
-    },
-    ModelMessageDelta {
-        text: String,
     },
     FunctionCallsRequested {
         calls: Vec<crate::model::ModelFunctionCall>,
@@ -108,6 +107,20 @@ pub enum TurnStreamEvent {
     TurnTokenUsage {
         usage: TokenUsage,
     },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum TurnModelEvent {
+    RequestStarted { iteration: usize },
+    AssistantMessage { text: String },
+    AssistantDelta { text: String },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RuntimeEvent {
+    pub source: String,
+    pub message: String,
+    pub metadata: Value,
 }
 
 pub type TurnEventHandler<'a> = dyn FnMut(TurnStreamEvent) + Send + 'a;
@@ -208,10 +221,10 @@ impl Agent {
         thread.turns.push(turn);
         thread = self.store.save(thread).await?;
         tracing::info!(thread_id, turn_id, "turn started");
-        on_event(TurnStreamEvent::TurnStarted {
+        on_event(TurnStreamEvent::State(TurnStateEvent::TurnStarted {
             thread_id: thread_id.to_string(),
             turn_id: turn_id.clone(),
-        });
+        }));
         let mut turn_token_usage = TokenUsage::default();
 
         let outcome = 'turn_loop: loop {
@@ -221,10 +234,14 @@ impl Agent {
                     session.projection.clone(),
                     runtime_context.as_deref(),
                 );
-                on_event(TurnStreamEvent::ModelRequestStarted { iteration });
+                on_event(TurnStreamEvent::Model(TurnModelEvent::RequestStarted {
+                    iteration,
+                }));
                 let mut model_event_handler = |event| match event {
                     ModelStreamEvent::AssistantDelta { text } => {
-                        on_event(TurnStreamEvent::ModelMessageDelta { text });
+                        on_event(TurnStreamEvent::Model(TurnModelEvent::AssistantDelta {
+                            text,
+                        }));
                     }
                     ModelStreamEvent::TokenUsage { usage } => {
                         turn_token_usage.add_assign(usage);
@@ -246,7 +263,9 @@ impl Agent {
 
                 match response {
                     ModelResponse::AssistantMessage { text } => {
-                        on_event(TurnStreamEvent::ModelMessage { text: text.clone() });
+                        on_event(TurnStreamEvent::Model(TurnModelEvent::AssistantMessage {
+                            text: text.clone(),
+                        }));
                         Self::push_turn_items(
                             &mut thread,
                             &session.active_turn_id,
@@ -270,9 +289,11 @@ impl Agent {
                             break 'turn_loop TurnOutcome::Failed { error };
                         }
 
-                        on_event(TurnStreamEvent::FunctionCallsRequested {
-                            calls: calls.clone(),
-                        });
+                        on_event(TurnStreamEvent::State(
+                            TurnStateEvent::FunctionCallsRequested {
+                                calls: calls.clone(),
+                            },
+                        ));
                         let call_items = calls
                             .iter()
                             .map(|call| {
@@ -292,10 +313,10 @@ impl Agent {
                         for call in calls {
                             let call_id = call.call_id.clone();
                             let name = call.name.clone();
-                            on_event(TurnStreamEvent::FunctionStarted {
+                            on_event(TurnStreamEvent::State(TurnStateEvent::FunctionStarted {
                                 call_id: call_id.clone(),
                                 name: name.clone(),
-                            });
+                            }));
                             let context = FunctionContext {
                                 projection: ThreadProjection::from_thread(&thread),
                             };
@@ -321,7 +342,9 @@ impl Agent {
                                     ));
                                     Self::push_turn_items(&mut thread, &turn_id, extra_items)?;
                                     thread = self.store.save(thread).await?;
-                                    on_event(TurnStreamEvent::FunctionCompleted { call_id, name });
+                                    on_event(TurnStreamEvent::State(
+                                        TurnStateEvent::FunctionCompleted { call_id, name },
+                                    ));
                                 }
                                 Ok(FunctionExecution::WaitingForUser {
                                     request_id,
@@ -345,11 +368,15 @@ impl Agent {
                                         &turn_id,
                                         TurnStatus::WaitingForUser,
                                     )?;
-                                    on_event(TurnStreamEvent::FunctionCompleted { call_id, name });
-                                    on_event(TurnStreamEvent::WaitingForUser {
-                                        request_id: request_id.clone(),
-                                        prompt: prompt.clone(),
-                                    });
+                                    on_event(TurnStreamEvent::State(
+                                        TurnStateEvent::FunctionCompleted { call_id, name },
+                                    ));
+                                    on_event(TurnStreamEvent::State(
+                                        TurnStateEvent::WaitingForUser {
+                                            request_id: request_id.clone(),
+                                            prompt: prompt.clone(),
+                                        },
+                                    ));
                                     break 'turn_loop TurnOutcome::WaitingForUser {
                                         request_id,
                                         prompt,
@@ -372,11 +399,13 @@ impl Agent {
                                         )],
                                     )?;
                                     thread = self.store.save(thread).await?;
-                                    on_event(TurnStreamEvent::FunctionFailed {
-                                        call_id,
-                                        name,
-                                        error: error_text,
-                                    });
+                                    on_event(TurnStreamEvent::State(
+                                        TurnStateEvent::FunctionFailed {
+                                            call_id,
+                                            name,
+                                            error: error_text,
+                                        },
+                                    ));
                                 }
                             }
                         }
@@ -393,14 +422,14 @@ impl Agent {
         Self::apply_turn_token_usage(&mut thread, turn_token_usage);
         self.store.save(thread).await?;
         if let TurnOutcome::Failed { error } = &outcome {
-            on_event(TurnStreamEvent::TurnFailed {
+            on_event(TurnStreamEvent::State(TurnStateEvent::TurnFailed {
                 error: error.clone(),
-            });
+            }));
         }
         Self::emit_turn_token_usage(&mut on_event, turn_token_usage);
-        on_event(TurnStreamEvent::TurnCompleted {
+        on_event(TurnStreamEvent::State(TurnStateEvent::TurnCompleted {
             outcome: outcome.clone(),
-        });
+        }));
         Ok(outcome)
     }
 
@@ -412,7 +441,9 @@ impl Agent {
 
     fn emit_turn_token_usage(on_event: &mut TurnEventHandler<'_>, usage: TokenUsage) {
         if !usage.is_zero() {
-            on_event(TurnStreamEvent::TurnTokenUsage { usage });
+            on_event(TurnStreamEvent::State(TurnStateEvent::TurnTokenUsage {
+                usage,
+            }));
         }
     }
 
@@ -514,7 +545,7 @@ mod tests {
     use crate::store::{JsonFileThreadStore, ThreadStore};
     use crate::{
         Agent, AgentConfig, Result, RuntimeContextInput, RuntimeContextProvider, TurnOutcome,
-        TurnStreamEvent,
+        TurnStateEvent, TurnStreamEvent,
     };
     use serde_json::json;
     use std::collections::VecDeque;
@@ -754,12 +785,14 @@ mod tests {
             }
         );
         let events = events.lock().expect("lock");
-        assert!(events
-            .iter()
-            .any(|event| matches!(event, TurnStreamEvent::FunctionStarted { .. })));
-        assert!(events
-            .iter()
-            .any(|event| matches!(event, TurnStreamEvent::TurnCompleted { .. })));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            TurnStreamEvent::State(TurnStateEvent::FunctionStarted { .. })
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            TurnStreamEvent::State(TurnStateEvent::TurnCompleted { .. })
+        )));
     }
 
     #[tokio::test]
@@ -811,7 +844,7 @@ mod tests {
         let usage = events
             .iter()
             .find_map(|event| match event {
-                TurnStreamEvent::TurnTokenUsage { usage } => Some(*usage),
+                TurnStreamEvent::State(TurnStateEvent::TurnTokenUsage { usage }) => Some(*usage),
                 _ => None,
             })
             .expect("usage event");

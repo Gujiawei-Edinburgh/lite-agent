@@ -3,7 +3,8 @@ use lite_agent_core::model::FunctionSpec;
 use lite_agent_core::FunctionContext;
 use lite_agent_core::{
     builtin_registry, init_file_logging, Agent, AgentConfig, ChatCompletionsClient,
-    FunctionRegistry, JsonFileThreadStore, ModelConfig, TurnOutcome, TurnStreamEvent,
+    FunctionRegistry, JsonFileThreadStore, ModelConfig, TurnModelEvent, TurnOutcome,
+    TurnStateEvent, TurnStreamEvent,
 };
 use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
@@ -296,13 +297,13 @@ struct StreamRenderState {
 
 fn print_stream_event(event: TurnStreamEvent, state: &mut StreamRenderState) {
     match event {
-        TurnStreamEvent::TurnStarted { turn_id, .. } => {
+        TurnStreamEvent::State(TurnStateEvent::TurnStarted { turn_id, .. }) => {
             print_process_line(state, &format!("[turn started] {turn_id}"));
         }
-        TurnStreamEvent::ModelRequestStarted { iteration } => {
+        TurnStreamEvent::Model(TurnModelEvent::RequestStarted { iteration }) => {
             print_process_line(state, &format!("[model] iteration {iteration}"));
         }
-        TurnStreamEvent::FunctionCallsRequested { calls } => {
+        TurnStreamEvent::State(TurnStateEvent::FunctionCallsRequested { calls }) => {
             for call in calls {
                 print_process_line(
                     state,
@@ -310,29 +311,29 @@ fn print_stream_event(event: TurnStreamEvent, state: &mut StreamRenderState) {
                 );
             }
         }
-        TurnStreamEvent::FunctionStarted { call_id, name } => {
+        TurnStreamEvent::State(TurnStateEvent::FunctionStarted { call_id, name }) => {
             print_process_line(state, &format!("[function started] {name} ({call_id})"));
         }
-        TurnStreamEvent::FunctionCompleted { call_id, name } => {
+        TurnStreamEvent::State(TurnStateEvent::FunctionCompleted { call_id, name }) => {
             print_process_line(state, &format!("[function completed] {name} ({call_id})"));
         }
-        TurnStreamEvent::FunctionFailed {
+        TurnStreamEvent::State(TurnStateEvent::FunctionFailed {
             call_id,
             name,
             error,
-        } => {
+        }) => {
             print_process_line(
                 state,
                 &format!("[function failed] {name} ({call_id}): {error}"),
             );
         }
-        TurnStreamEvent::WaitingForUser { prompt, .. } => {
+        TurnStreamEvent::State(TurnStateEvent::WaitingForUser { prompt, .. }) => {
             print_process_line(state, &format!("[waiting for user] {prompt}"));
         }
-        TurnStreamEvent::TurnFailed { error } => {
+        TurnStreamEvent::State(TurnStateEvent::TurnFailed { error }) => {
             print_process_line(state, &format!("[turn failed] {error}"));
         }
-        TurnStreamEvent::ModelMessageDelta { text } => {
+        TurnStreamEvent::Model(TurnModelEvent::AssistantDelta { text }) => {
             if !text.is_empty() {
                 state.assistant_started = true;
                 state.line_open = !text.ends_with('\n');
@@ -340,8 +341,14 @@ fn print_stream_event(event: TurnStreamEvent, state: &mut StreamRenderState) {
                 let _ = std_io::stdout().flush();
             }
         }
-        TurnStreamEvent::TurnTokenUsage { usage } => {println!("{}", usage.total_tokens)}
-        TurnStreamEvent::ModelMessage { .. } | TurnStreamEvent::TurnCompleted { .. } => {}
+        TurnStreamEvent::State(TurnStateEvent::TurnTokenUsage { usage }) => {
+            print_process_line(state, &format!("[tokens] {usage}"));
+        }
+        TurnStreamEvent::Runtime(event) => {
+            print_process_line(state, &format!("[{}] {}", event.source, event.message));
+        }
+        TurnStreamEvent::Model(TurnModelEvent::AssistantMessage { .. })
+        | TurnStreamEvent::State(TurnStateEvent::TurnCompleted { .. }) => {}
     }
 }
 
@@ -357,25 +364,25 @@ fn print_process_line(state: &mut StreamRenderState, line: &str) {
 #[cfg(test)]
 mod tests {
     use super::{print_stream_event, StreamRenderState};
-    use lite_agent_core::TurnStreamEvent;
+    use lite_agent_core::{TurnModelEvent, TurnStreamEvent};
 
     #[test]
     fn assistant_delta_marks_line_open_until_newline() {
         let mut state = StreamRenderState::default();
 
         print_stream_event(
-            TurnStreamEvent::ModelMessageDelta {
+            TurnStreamEvent::Model(TurnModelEvent::AssistantDelta {
                 text: "你好".to_string(),
-            },
+            }),
             &mut state,
         );
         assert!(state.assistant_started);
         assert!(state.line_open);
 
         print_stream_event(
-            TurnStreamEvent::ModelMessageDelta {
+            TurnStreamEvent::Model(TurnModelEvent::AssistantDelta {
                 text: "\n".to_string(),
-            },
+            }),
             &mut state,
         );
         assert!(state.assistant_started);

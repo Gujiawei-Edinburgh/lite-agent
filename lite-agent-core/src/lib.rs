@@ -8,7 +8,8 @@ pub mod projection;
 pub mod store;
 
 pub use agent_loop::{
-    Agent, AgentConfig, RuntimeContextInput, RuntimeContextProvider, TurnOutcome, TurnStreamEvent,
+    Agent, AgentConfig, RuntimeContextInput, RuntimeContextProvider, RuntimeEvent, TurnModelEvent,
+    TurnOutcome, TurnStateEvent, TurnStreamEvent,
 };
 pub use error::{AgentError, Result};
 pub use events::{
