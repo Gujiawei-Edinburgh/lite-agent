@@ -2,9 +2,9 @@ use lite_agent_core::functions::{FunctionExecution, SimpleFunction};
 use lite_agent_core::model::FunctionSpec;
 use lite_agent_core::FunctionContext;
 use lite_agent_core::{
-    builtin_registry, init_file_logging, Agent, AgentConfig, ChatCompletionsClient,
-    FunctionRegistry, JsonFileThreadStore, ModelConfig, TurnModelEvent, TurnOutcome,
-    TurnStateEvent, TurnStreamEvent,
+    builtin_registry, init_file_logging, turn_abort_pair, Agent, AgentConfig,
+    ChatCompletionsClient, FunctionRegistry, JsonFileThreadStore, ModelConfig, ThreadStore,
+    TurnModelEvent, TurnOutcome, TurnStateEvent, TurnStreamEvent,
 };
 use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
@@ -53,12 +53,12 @@ async fn main() -> lite_agent_core::Result<()> {
     }));
     let agent = Agent::new(
         AgentConfig::default(),
-        store,
+        store.clone(),
         model_client,
         example_registry(args.command_cwd),
     );
 
-    run_repl(agent, thread_id).await
+    run_repl(agent, store, thread_id).await
 }
 
 fn example_registry(command_cwd: PathBuf) -> FunctionRegistry {
@@ -229,7 +229,11 @@ fn help_text() -> String {
     .to_string()
 }
 
-async fn run_repl(agent: Agent, thread_id: String) -> lite_agent_core::Result<()> {
+async fn run_repl(
+    agent: Agent,
+    store: Arc<JsonFileThreadStore>,
+    thread_id: String,
+) -> lite_agent_core::Result<()> {
     let mut editor = DefaultEditor::new().map_err(|error| {
         lite_agent_core::AgentError::Model(format!("failed to initialize REPL: {error}"))
     })?;
@@ -239,7 +243,7 @@ async fn run_repl(agent: Agent, thread_id: String) -> lite_agent_core::Result<()
     loop {
         let line = match editor.readline("> ") {
             Ok(line) => line,
-            Err(ReadlineError::Interrupted) => continue,
+            Err(ReadlineError::Interrupted) => break,
             Err(ReadlineError::Eof) => break,
             Err(error) => {
                 return Err(lite_agent_core::AgentError::Model(format!(
@@ -258,13 +262,28 @@ async fn run_repl(agent: Agent, thread_id: String) -> lite_agent_core::Result<()
 
         let render_state = Arc::new(Mutex::new(StreamRenderState::default()));
         let render_state_for_events = render_state.clone();
-        let outcome = agent
-            .run_turn_stream(&thread_id, input.to_string(), move |event| {
+        let (abort_handle, abort_signal) = turn_abort_pair();
+        let turn = agent.run_turn_stream_abortable(
+            &thread_id,
+            input.to_string(),
+            abort_signal,
+            move |event| {
                 if let Ok(mut state) = render_state_for_events.lock() {
                     print_stream_event(event, &mut state);
                 }
-            })
-            .await?;
+            },
+        );
+        tokio::pin!(turn);
+        let outcome = tokio::select! {
+            result = &mut turn => result?,
+            signal = tokio::signal::ctrl_c() => {
+                signal.map_err(lite_agent_core::AgentError::Io)?;
+                abort_handle.abort();
+                let outcome = turn.await?;
+                println!();
+                outcome
+            }
+        };
 
         match outcome {
             TurnOutcome::AssistantMessage { text } => {
@@ -283,9 +302,29 @@ async fn run_repl(agent: Agent, thread_id: String) -> lite_agent_core::Result<()
             TurnOutcome::Failed { error } => {
                 println!("turn failed: {error}");
             }
+            TurnOutcome::Aborted { reason: _ } => {
+                continue;
+            }
         }
     }
 
+    print_thread_token_usage(store, &thread_id).await?;
+    Ok(())
+}
+
+async fn print_thread_token_usage(
+    store: Arc<JsonFileThreadStore>,
+    thread_id: &str,
+) -> lite_agent_core::Result<()> {
+    match store.load(thread_id).await {
+        Ok(thread) => {
+            println!("[thread tokens] {}", thread.token_usage);
+        }
+        Err(lite_agent_core::AgentError::ThreadNotFound(_)) => {
+            println!("[thread tokens] input=0, cached_input=0, output=0, total=0");
+        }
+        Err(error) => return Err(error),
+    }
     Ok(())
 }
 
@@ -333,6 +372,9 @@ fn print_stream_event(event: TurnStreamEvent, state: &mut StreamRenderState) {
         TurnStreamEvent::State(TurnStateEvent::TurnFailed { error }) => {
             print_process_line(state, &format!("[turn failed] {error}"));
         }
+        TurnStreamEvent::State(TurnStateEvent::TurnAborted { reason }) => {
+            print_process_line(state, &format!("[turn aborted] {reason}"));
+        }
         TurnStreamEvent::Model(TurnModelEvent::AssistantDelta { text }) => {
             if !text.is_empty() {
                 state.assistant_started = true;
@@ -341,13 +383,11 @@ fn print_stream_event(event: TurnStreamEvent, state: &mut StreamRenderState) {
                 let _ = std_io::stdout().flush();
             }
         }
-        TurnStreamEvent::State(TurnStateEvent::TurnTokenUsage { usage }) => {
-            print_process_line(state, &format!("[tokens] {usage}"));
-        }
         TurnStreamEvent::Runtime(event) => {
             print_process_line(state, &format!("[{}] {}", event.source, event.message));
         }
         TurnStreamEvent::Model(TurnModelEvent::AssistantMessage { .. })
+        | TurnStreamEvent::State(TurnStateEvent::TurnTokenUsage { .. })
         | TurnStreamEvent::State(TurnStateEvent::TurnCompleted { .. }) => {}
     }
 }

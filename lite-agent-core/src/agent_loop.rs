@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
+use tokio::sync::{watch, Mutex as AsyncMutex, OwnedMutexGuard};
 
 pub trait RuntimeContextProvider: Send + Sync {
     fn context_for_turn(&self, input: RuntimeContextInput<'_>) -> Option<String>;
@@ -65,6 +65,7 @@ pub enum TurnOutcome {
     AssistantMessage { text: String },
     WaitingForUser { request_id: String, prompt: String },
     Failed { error: String },
+    Aborted { reason: String },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -106,6 +107,9 @@ pub enum TurnStateEvent {
     TurnFailed {
         error: String,
     },
+    TurnAborted {
+        reason: String,
+    },
     TurnTokenUsage {
         usage: TokenUsage,
     },
@@ -126,6 +130,41 @@ pub struct RuntimeEvent {
 }
 
 pub type TurnEventHandler<'a> = dyn FnMut(TurnStreamEvent) + Send + 'a;
+
+#[derive(Debug, Clone)]
+pub struct TurnAbortHandle {
+    sender: watch::Sender<bool>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TurnAbortSignal {
+    receiver: watch::Receiver<bool>,
+}
+
+pub fn turn_abort_pair() -> (TurnAbortHandle, TurnAbortSignal) {
+    let (sender, receiver) = watch::channel(false);
+    (TurnAbortHandle { sender }, TurnAbortSignal { receiver })
+}
+
+impl TurnAbortHandle {
+    pub fn abort(&self) {
+        let _ = self.sender.send(true);
+    }
+}
+
+impl TurnAbortSignal {
+    async fn cancelled(&mut self) {
+        if *self.receiver.borrow() {
+            return;
+        }
+        while self.receiver.changed().await.is_ok() {
+            if *self.receiver.borrow() {
+                return;
+            }
+        }
+        std::future::pending::<()>().await;
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct FunctionCallHookContext {
@@ -241,6 +280,21 @@ impl Agent {
         &self,
         thread_id: &str,
         user_text: impl Into<String>,
+        on_event: F,
+    ) -> Result<TurnOutcome>
+    where
+        F: FnMut(TurnStreamEvent) + Send + 'a,
+    {
+        let (_abort_handle, abort_signal) = turn_abort_pair();
+        self.run_turn_stream_abortable(thread_id, user_text, abort_signal, on_event)
+            .await
+    }
+
+    pub async fn run_turn_stream_abortable<'a, F>(
+        &self,
+        thread_id: &str,
+        user_text: impl Into<String>,
+        mut abort_signal: TurnAbortSignal,
         mut on_event: F,
     ) -> Result<TurnOutcome>
     where
@@ -308,10 +362,18 @@ impl Agent {
                         turn_token_usage.add_assign(usage);
                     }
                 };
-                let response = self
+                let model_call = self
                     .model_client
-                    .stream_complete(request, &mut model_event_handler)
-                    .await;
+                    .stream_complete(request, &mut model_event_handler);
+                let response = tokio::select! {
+                    response = model_call => response,
+                    () = abort_signal.cancelled() => {
+                        let reason = "turn aborted by caller".to_string();
+                        tracing::info!(thread_id, turn_id, "turn aborted during model request");
+                        self.abort_turn(&mut thread, &session.active_turn_id, reason.clone())?;
+                        break 'turn_loop TurnOutcome::Aborted { reason };
+                    }
+                };
                 let response = match response {
                     Ok(response) => response,
                     Err(error) => {
@@ -393,9 +455,20 @@ impl Agent {
                             let execution = match pre_hook_result {
                                 Ok(()) => {
                                     let context = FunctionContext { projection };
-                                    self.function_registry
-                                        .call(&call.name, call.arguments.clone(), context)
-                                        .await
+                                    let function_call = self.function_registry.call(
+                                        &call.name,
+                                        call.arguments.clone(),
+                                        context,
+                                    );
+                                    tokio::select! {
+                                        execution = function_call => execution,
+                                        () = abort_signal.cancelled() => {
+                                            let reason = "turn aborted by caller".to_string();
+                                            tracing::info!(thread_id, turn_id, "turn aborted during function call");
+                                            self.abort_turn(&mut thread, &turn_id, reason.clone())?;
+                                            break 'turn_loop TurnOutcome::Aborted { reason };
+                                        }
+                                    }
                                 }
                                 Err(error) => Err(error),
                             };
@@ -528,6 +601,11 @@ impl Agent {
         if let TurnOutcome::Failed { error } = &outcome {
             on_event(TurnStreamEvent::State(TurnStateEvent::TurnFailed {
                 error: error.clone(),
+            }));
+        }
+        if let TurnOutcome::Aborted { reason } = &outcome {
+            on_event(TurnStreamEvent::State(TurnStateEvent::TurnAborted {
+                reason: reason.clone(),
             }));
         }
         Self::emit_turn_token_usage(&mut on_event, turn_token_usage);
@@ -672,6 +750,18 @@ impl Agent {
         )?;
         Self::set_turn_status(thread, turn_id, TurnStatus::Failed)
     }
+
+    fn abort_turn(&self, thread: &mut Thread, turn_id: &str, reason: String) -> Result<()> {
+        Self::push_turn_items(
+            thread,
+            turn_id,
+            vec![TurnItem::new(
+                TurnItemSource::Runtime,
+                TurnItemKind::TurnAborted { reason },
+            )],
+        )?;
+        Self::set_turn_status(thread, turn_id, TurnStatus::Aborted)
+    }
 }
 
 #[cfg(test)]
@@ -684,7 +774,7 @@ mod tests {
     };
     use crate::store::{JsonFileThreadStore, ThreadStore};
     use crate::{
-        Agent, AgentConfig, AgentError, FunctionCallHook, FunctionCallHookContext,
+        turn_abort_pair, Agent, AgentConfig, AgentError, FunctionCallHook, FunctionCallHookContext,
         FunctionCallHookResult, Result, RuntimeContextInput, RuntimeContextProvider, RuntimeEvent,
         TurnOutcome, TurnStateEvent, TurnStreamEvent,
     };
@@ -753,6 +843,18 @@ mod tests {
                     text: "done".to_string(),
                 })
             })
+        }
+    }
+
+    struct PendingModel;
+
+    impl ModelClient for PendingModel {
+        fn stream_complete<'a>(
+            &'a self,
+            _request: ModelRequest,
+            _on_event: &'a mut ModelStreamHandler<'a>,
+        ) -> Pin<Box<dyn Future<Output = Result<ModelResponse>> + Send + 'a>> {
+            Box::pin(async move { std::future::pending::<Result<ModelResponse>>().await })
         }
     }
 
@@ -898,6 +1000,58 @@ mod tests {
             .turns
             .iter()
             .all(|turn| turn.status == TurnStatus::Completed));
+    }
+
+    #[tokio::test]
+    async fn abort_during_model_request_persists_aborted_turn() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(JsonFileThreadStore::new(temp.path()));
+        let agent = Arc::new(Agent::new(
+            AgentConfig::default(),
+            store.clone(),
+            Arc::new(PendingModel),
+            builtin_registry(),
+        ));
+        let (abort_handle, abort_signal) = turn_abort_pair();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let started_tx = Arc::new(Mutex::new(Some(started_tx)));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let captured_events = events.clone();
+        let captured_started = started_tx.clone();
+        let turn_agent = agent.clone();
+
+        let turn = tokio::spawn(async move {
+            turn_agent
+                .run_turn_stream_abortable("t", "slow", abort_signal, move |event| {
+                    if matches!(
+                        event,
+                        TurnStreamEvent::State(TurnStateEvent::TurnStarted { .. })
+                    ) {
+                        if let Some(sender) = captured_started.lock().expect("started").take() {
+                            let _ = sender.send(());
+                        }
+                    }
+                    captured_events.lock().expect("events").push(event);
+                })
+                .await
+        });
+
+        started_rx.await.expect("turn started");
+        abort_handle.abort();
+        let outcome = turn.await.expect("join").expect("turn");
+
+        assert!(matches!(outcome, TurnOutcome::Aborted { .. }));
+        let thread = store.load("t").await.expect("thread");
+        assert_eq!(thread.turns.len(), 1);
+        assert_eq!(thread.turns[0].status, TurnStatus::Aborted);
+        assert!(thread.turns[0]
+            .items
+            .iter()
+            .any(|item| matches!(item.kind, TurnItemKind::TurnAborted { .. })));
+        assert!(events.lock().expect("events").iter().any(|event| matches!(
+            event,
+            TurnStreamEvent::State(TurnStateEvent::TurnAborted { .. })
+        )));
     }
 
     #[test]
