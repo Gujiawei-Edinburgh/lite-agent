@@ -367,14 +367,20 @@ impl Agent {
                 let model_call = self
                     .model_client
                     .stream_complete(request, &mut model_event_handler);
-                let response = tokio::select! {
-                    response = model_call => response,
-                    () = abort_signal.cancelled() => {
-                        let reason = "turn aborted by caller".to_string();
-                        tracing::info!(thread_id, turn_id, "turn aborted during model request");
-                        self.abort_turn(&mut thread, &session.active_turn_id, reason.clone())?;
-                        break 'turn_loop TurnOutcome::Aborted { reason };
-                    }
+                let response = self
+                    .await_step_or_abort(
+                        model_call,
+                        &mut abort_signal,
+                        &mut thread,
+                        thread_id,
+                        &session.active_turn_id,
+                        "model request",
+                    )
+                    .await?;
+                let Some(response) = response else {
+                    break 'turn_loop TurnOutcome::Aborted {
+                        reason: "turn aborted by caller".to_string(),
+                    };
                 };
                 let response = match response {
                     Ok(response) => response,
@@ -488,19 +494,24 @@ impl Agent {
                                         call.arguments.clone(),
                                         context,
                                     );
-                                    tokio::select! {
-                                        execution = function_call => execution,
-                                        () = abort_signal.cancelled() => {
-                                            let reason = "turn aborted by caller".to_string();
-                                            tracing::info!(thread_id, turn_id, "turn aborted during function call");
-                                            self.abort_turn(&mut thread, &turn_id, reason.clone())?;
-                                            break 'turn_loop TurnOutcome::Aborted { reason };
-                                        }
-                                    }
+                                    self.await_step_or_abort(
+                                        function_call,
+                                        &mut abort_signal,
+                                        &mut thread,
+                                        thread_id,
+                                        &turn_id,
+                                        "function call",
+                                    )
+                                    .await?
                                 }
-                                Err(error) => Err(error),
+                                Err(error) => Some(Err(error)),
                             };
 
+                            let Some(execution) = execution else {
+                                break 'turn_loop TurnOutcome::Aborted {
+                                    reason: "turn aborted by caller".to_string(),
+                                };
+                            };
                             match execution {
                                 Ok(FunctionExecution::Completed {
                                     output,
@@ -690,6 +701,29 @@ impl Agent {
     fn apply_turn_token_usage(thread: &mut Thread, usage: TokenUsage) {
         if !usage.is_zero() {
             thread.token_usage.add_assign(usage);
+        }
+    }
+
+    async fn await_step_or_abort<T, F>(
+        &self,
+        future: F,
+        abort_signal: &mut TurnAbortSignal,
+        thread: &mut Thread,
+        thread_id: &str,
+        turn_id: &str,
+        step: &str,
+    ) -> Result<Option<Result<T>>>
+    where
+        F: Future<Output = Result<T>> + Send,
+    {
+        tokio::select! {
+            result = future => Ok(Some(result)),
+            () = abort_signal.cancelled() => {
+                let reason = "turn aborted by caller".to_string();
+                tracing::info!(thread_id, turn_id, step, "turn aborted");
+                self.abort_turn(thread, turn_id, reason)?;
+                Ok(None)
+            }
         }
     }
 
