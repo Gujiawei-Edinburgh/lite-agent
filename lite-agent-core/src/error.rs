@@ -7,6 +7,9 @@ pub enum AgentError {
     #[error("thread not found: {0}")]
     ThreadNotFound(String),
 
+    #[error("invalid thread id: {0}")]
+    InvalidThreadId(String),
+
     #[error("turn not found: {0}")]
     TurnNotFound(String),
 

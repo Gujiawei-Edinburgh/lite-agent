@@ -57,12 +57,7 @@ impl ThreadProjection {
                 .turns
                 .iter()
                 .rev()
-                .find(|turn| {
-                    matches!(
-                        turn.status,
-                        TurnStatus::Running | TurnStatus::WaitingForUser
-                    )
-                })
+                .find(|turn| matches!(turn.status, TurnStatus::Running))
                 .map(|turn| turn.id.clone()),
             ..Self::default()
         };
@@ -177,6 +172,7 @@ fn flush_tool_calls(
 mod tests {
     use crate::events::{
         GoalState, GoalStatus, Thread, ToolResult, Turn, TurnItem, TurnItemKind, TurnItemSource,
+        TurnStatus,
     };
     use serde_json::json;
 
@@ -287,5 +283,34 @@ mod tests {
             &projection.messages_for_model[0],
             ChatMessage::Assistant { tool_calls, .. } if tool_calls.len() == 2
         ));
+    }
+
+    #[test]
+    fn answered_waiting_turn_is_not_active() {
+        let mut thread = Thread::new("t");
+        let mut waiting_turn = Turn::new();
+        waiting_turn.set_status(TurnStatus::WaitingForUser);
+        waiting_turn.push_item(TurnItem::new(
+            TurnItemSource::Runtime,
+            TurnItemKind::UserInputRequested {
+                request_id: "r1".to_string(),
+                prompt: "Which one?".to_string(),
+            },
+        ));
+        thread.turns.push(waiting_turn);
+
+        let mut response_turn = Turn::new();
+        response_turn.set_status(TurnStatus::Completed);
+        response_turn.push_item(TurnItem::new(
+            TurnItemSource::User,
+            TurnItemKind::UserInput {
+                text: "the first one".to_string(),
+                response_to: Some("r1".to_string()),
+            },
+        ));
+        thread.turns.push(response_turn);
+
+        let projection = ThreadProjection::from_thread(&thread);
+        assert_eq!(projection.active_turn_id, None);
     }
 }

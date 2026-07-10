@@ -1,3 +1,4 @@
+use crate::agent_loop::TurnAbortSignal;
 use crate::error::{AgentError, Result};
 use crate::events::{new_id, GoalState, GoalStatus, TurnItem, TurnItemKind, TurnItemSource};
 use crate::model::FunctionSpec;
@@ -11,7 +12,11 @@ use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 pub struct FunctionContext {
+    pub thread_id: String,
+    pub turn_id: String,
+    pub call_id: String,
     pub projection: ThreadProjection,
+    pub abort_signal: TurnAbortSignal,
 }
 
 #[derive(Debug, Clone)]
@@ -289,7 +294,11 @@ mod tests {
                 "update_goal",
                 json!({ "objective": "ship v1", "status": "active" }),
                 FunctionContext {
+                    thread_id: "t".to_string(),
+                    turn_id: "turn".to_string(),
+                    call_id: "call".to_string(),
                     projection: ThreadProjection::from_thread(&Thread::new("t")),
+                    abort_signal: crate::agent_loop::turn_abort_pair().1,
                 },
             )
             .await
@@ -321,7 +330,11 @@ mod tests {
                 "ask_user",
                 json!({ "prompt": "Which thread?" }),
                 FunctionContext {
+                    thread_id: "t".to_string(),
+                    turn_id: "turn".to_string(),
+                    call_id: "call".to_string(),
                     projection: ThreadProjection::from_thread(&Thread::new("t")),
+                    abort_signal: crate::agent_loop::turn_abort_pair().1,
                 },
             )
             .await

@@ -12,6 +12,8 @@ static ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Thread {
+    #[serde(default = "current_schema_version")]
+    pub schema_version: u32,
     pub id: ThreadId,
     pub goal: Option<GoalState>,
     pub turns: Vec<Turn>,
@@ -25,6 +27,7 @@ impl Thread {
     pub fn new(id: impl Into<ThreadId>) -> Self {
         let now = now_timestamp();
         Self {
+            schema_version: current_schema_version(),
             id: id.into(),
             goal: None,
             turns: Vec::new(),
@@ -41,6 +44,10 @@ impl Thread {
     pub fn turn_mut(&mut self, turn_id: &str) -> Option<&mut Turn> {
         self.turns.iter_mut().find(|turn| turn.id == turn_id)
     }
+}
+
+fn current_schema_version() -> u32 {
+    1
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -108,6 +115,12 @@ impl Turn {
     pub fn set_status(&mut self, status: TurnStatus) {
         self.status = status;
         self.updated_at = now_timestamp();
+    }
+}
+
+impl Default for Turn {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

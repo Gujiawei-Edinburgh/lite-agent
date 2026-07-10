@@ -388,7 +388,7 @@ fn print_stream_event(event: TurnStreamEvent, state: &mut StreamRenderState) {
         }
         TurnStreamEvent::Model(TurnModelEvent::AssistantMessage { .. })
         | TurnStreamEvent::State(TurnStateEvent::TurnTokenUsage { .. })
-        | TurnStreamEvent::State(TurnStateEvent::TurnCompleted { .. }) => {}
+        | TurnStreamEvent::State(TurnStateEvent::TurnFinished { .. }) => {}
     }
 }
 

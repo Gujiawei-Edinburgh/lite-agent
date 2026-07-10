@@ -37,8 +37,16 @@ pub struct ModelRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum ModelResponse {
-    AssistantMessage { text: String },
-    FunctionCalls { calls: Vec<ModelFunctionCall> },
+    Assistant {
+        text: Option<String>,
+        function_calls: Vec<ModelFunctionCall>,
+    },
+    AssistantMessage {
+        text: String,
+    },
+    FunctionCalls {
+        calls: Vec<ModelFunctionCall>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -131,17 +139,14 @@ impl ModelClient for ChatCompletionsClient {
                 handle_sse_frame(&buffer, &mut assistant_text, &mut tool_calls, on_event).await?;
             }
 
-            if !tool_calls.is_empty() {
-                let calls = tool_calls
-                    .into_values()
-                    .map(PartialToolCall::finish)
-                    .collect::<Result<Vec<_>>>()?;
-                Ok(ModelResponse::FunctionCalls { calls })
-            } else {
-                Ok(ModelResponse::AssistantMessage {
-                    text: assistant_text,
-                })
-            }
+            let calls = tool_calls
+                .into_values()
+                .map(PartialToolCall::finish)
+                .collect::<Result<Vec<_>>>()?;
+            Ok(ModelResponse::Assistant {
+                text: (!assistant_text.is_empty()).then_some(assistant_text),
+                function_calls: calls,
+            })
         })
     }
 }

@@ -6,6 +6,7 @@ use std::pin::Pin;
 use tokio::fs;
 
 pub trait ThreadStore: Send + Sync {
+    /// Load one durable thread snapshot.
     fn load<'a>(
         &'a self,
         thread_id: &'a str,
@@ -37,6 +38,8 @@ pub trait ThreadStore: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<Thread>> + Send + 'a>>;
 }
 
+/// Single-process JSON persistence intended for local development and examples.
+/// Production deployments should provide a repository with atomic/versioned commits.
 #[derive(Debug, Clone)]
 pub struct JsonFileThreadStore {
     state_dir: PathBuf,
@@ -55,6 +58,18 @@ impl JsonFileThreadStore {
             .join(format!("{thread_id}.json"))
     }
 
+    fn validate_thread_id(thread_id: &str) -> Result<()> {
+        if thread_id.is_empty()
+            || thread_id == "."
+            || thread_id == ".."
+            || thread_id.contains('/')
+            || thread_id.contains('\\')
+        {
+            return Err(AgentError::InvalidThreadId(thread_id.to_string()));
+        }
+        Ok(())
+    }
+
     pub fn state_dir(&self) -> &Path {
         &self.state_dir
     }
@@ -65,7 +80,10 @@ impl JsonFileThreadStore {
             fs::create_dir_all(parent).await?;
         }
         let raw = serde_json::to_string_pretty(thread)?;
-        fs::write(path, raw).await?;
+        let temporary_path =
+            path.with_extension(format!("json.{}.tmp", crate::events::new_id("write")));
+        fs::write(&temporary_path, raw).await?;
+        fs::rename(temporary_path, path).await?;
         Ok(())
     }
 }
@@ -76,6 +94,7 @@ impl ThreadStore for JsonFileThreadStore {
         thread_id: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<Thread>> + Send + 'a>> {
         Box::pin(async move {
+            Self::validate_thread_id(thread_id)?;
             let path = self.thread_path(thread_id);
             match fs::read_to_string(path).await {
                 Ok(raw) => Ok(serde_json::from_str(&raw)?),
@@ -92,6 +111,7 @@ impl ThreadStore for JsonFileThreadStore {
         mut thread: Thread,
     ) -> Pin<Box<dyn Future<Output = Result<Thread>> + Send + 'a>> {
         Box::pin(async move {
+            Self::validate_thread_id(&thread.id)?;
             thread.touch();
             self.write_thread(&thread).await?;
             Ok(thread)
@@ -104,6 +124,7 @@ impl ThreadStore for JsonFileThreadStore {
         turn: Turn,
     ) -> Pin<Box<dyn Future<Output = Result<Thread>> + Send + 'a>> {
         Box::pin(async move {
+            Self::validate_thread_id(thread_id)?;
             let mut thread = match self.load(thread_id).await {
                 Ok(thread) => thread,
                 Err(AgentError::ThreadNotFound(_)) => Thread::new(thread_id),
@@ -123,6 +144,7 @@ impl ThreadStore for JsonFileThreadStore {
         items: Vec<TurnItem>,
     ) -> Pin<Box<dyn Future<Output = Result<Thread>> + Send + 'a>> {
         Box::pin(async move {
+            Self::validate_thread_id(thread_id)?;
             let mut thread = self.load(thread_id).await?;
             let turn = thread
                 .turn_mut(turn_id)
@@ -143,6 +165,7 @@ impl ThreadStore for JsonFileThreadStore {
         status: TurnStatus,
     ) -> Pin<Box<dyn Future<Output = Result<Thread>> + Send + 'a>> {
         Box::pin(async move {
+            Self::validate_thread_id(thread_id)?;
             let mut thread = self.load(thread_id).await?;
             let turn = thread
                 .turn_mut(turn_id)
@@ -218,5 +241,16 @@ mod tests {
 
         assert_eq!(thread.turns[0].status, TurnStatus::Completed);
         assert_eq!(thread.turns[0].items.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn rejects_path_traversal_thread_ids() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = JsonFileThreadStore::new(temp.path());
+        let error = store.load("../outside").await.expect_err("invalid id");
+        assert!(matches!(
+            error,
+            crate::AgentError::InvalidThreadId(value) if value == "../outside"
+        ));
     }
 }

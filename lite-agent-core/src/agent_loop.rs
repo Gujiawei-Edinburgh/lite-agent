@@ -50,7 +50,7 @@ impl Default for AgentConfig {
         Self {
             max_model_iterations: 128,
             system_prompt: concat!(
-                "You are a lite Q&A agent. Use functions only when they are useful. ",
+                "You are an agent runtime assistant. Use functions only when they are useful. ",
                 "Thread goal is explicit durable state. Turn items are factual append-only records. ",
                 "Ask the user when required information is missing."
             )
@@ -101,7 +101,7 @@ pub enum TurnStateEvent {
         request_id: String,
         prompt: String,
     },
-    TurnCompleted {
+    TurnFinished {
         outcome: TurnOutcome,
     },
     TurnFailed {
@@ -174,6 +174,8 @@ pub struct FunctionCallHookContext {
     pub name: String,
     pub arguments: Value,
     pub projection: ThreadProjection,
+    /// Set for after-hooks after the resulting thread state has been reconstructed.
+    pub projection_after: Option<ThreadProjection>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -342,7 +344,7 @@ impl Agent {
         }));
         let mut turn_token_usage = TokenUsage::default();
 
-        let outcome = 'turn_loop: loop {
+        let outcome = 'turn_loop: {
             for iteration in 0..self.config.max_model_iterations {
                 let session = Session::from_thread(&thread, turn_id.clone());
                 let request = self.model_request_from_projection(
@@ -384,27 +386,46 @@ impl Agent {
                     }
                 };
 
+                let response = match response {
+                    ModelResponse::AssistantMessage { text } => ModelResponse::Assistant {
+                        text: Some(text),
+                        function_calls: Vec::new(),
+                    },
+                    ModelResponse::FunctionCalls { calls } => ModelResponse::Assistant {
+                        text: None,
+                        function_calls: calls,
+                    },
+                    response => response,
+                };
                 match response {
-                    ModelResponse::AssistantMessage { text } => {
-                        on_event(TurnStreamEvent::Model(TurnModelEvent::AssistantMessage {
-                            text: text.clone(),
-                        }));
-                        Self::push_turn_items(
-                            &mut thread,
-                            &session.active_turn_id,
-                            vec![TurnItem::new(
-                                TurnItemSource::Model,
-                                TurnItemKind::ModelMessage { text: text.clone() },
-                            )],
-                        )?;
-                        Self::set_turn_status(
-                            &mut thread,
-                            &session.active_turn_id,
-                            TurnStatus::Completed,
-                        )?;
-                        break 'turn_loop TurnOutcome::AssistantMessage { text };
-                    }
-                    ModelResponse::FunctionCalls { calls } => {
+                    ModelResponse::Assistant {
+                        text,
+                        function_calls,
+                    } => {
+                        if let Some(text) = &text {
+                            on_event(TurnStreamEvent::Model(TurnModelEvent::AssistantMessage {
+                                text: text.clone(),
+                            }));
+                            Self::push_turn_items(
+                                &mut thread,
+                                &session.active_turn_id,
+                                vec![TurnItem::new(
+                                    TurnItemSource::Model,
+                                    TurnItemKind::ModelMessage { text: text.clone() },
+                                )],
+                            )?;
+                            thread = self.store.save(thread).await?;
+                        }
+                        if function_calls.is_empty() {
+                            let text = text.unwrap_or_default();
+                            Self::set_turn_status(
+                                &mut thread,
+                                &session.active_turn_id,
+                                TurnStatus::Completed,
+                            )?;
+                            break 'turn_loop TurnOutcome::AssistantMessage { text };
+                        }
+                        let calls = function_calls;
                         if calls.is_empty() {
                             let error = "model returned an empty function call list".to_string();
                             tracing::warn!(error, "empty function call list");
@@ -433,7 +454,7 @@ impl Agent {
                         Self::push_turn_items(&mut thread, &session.active_turn_id, call_items)?;
                         thread = self.store.save(thread).await?;
 
-                        for call in calls {
+                        for (call_index, call) in calls.iter().enumerate() {
                             let call_id = call.call_id.clone();
                             let name = call.name.clone();
                             on_event(TurnStreamEvent::State(TurnStateEvent::FunctionStarted {
@@ -448,13 +469,20 @@ impl Agent {
                                 name: name.clone(),
                                 arguments: call.arguments.clone(),
                                 projection: projection.clone(),
+                                projection_after: None,
                             };
                             let pre_hook_result = self
                                 .run_before_function_call_hooks(hook_context.clone(), &mut on_event)
                                 .await;
                             let execution = match pre_hook_result {
                                 Ok(()) => {
-                                    let context = FunctionContext { projection };
+                                    let context = FunctionContext {
+                                        thread_id: thread.id.clone(),
+                                        turn_id: turn_id.clone(),
+                                        call_id: call_id.clone(),
+                                        projection,
+                                        abort_signal: abort_signal.clone(),
+                                    };
                                     let function_call = self.function_registry.call(
                                         &call.name,
                                         call.arguments.clone(),
@@ -493,8 +521,11 @@ impl Agent {
                                     ));
                                     Self::push_turn_items(&mut thread, &turn_id, extra_items)?;
                                     thread = self.store.save(thread).await?;
+                                    let mut after_context = hook_context.clone();
+                                    after_context.projection_after =
+                                        Some(ThreadProjection::from_thread(&thread));
                                     self.run_after_function_call_hooks(
-                                        hook_context,
+                                        after_context,
                                         hook_result,
                                         &mut on_event,
                                     )
@@ -530,8 +561,12 @@ impl Agent {
                                         &turn_id,
                                         TurnStatus::WaitingForUser,
                                     )?;
+                                    thread = self.store.save(thread).await?;
+                                    let mut after_context = hook_context.clone();
+                                    after_context.projection_after =
+                                        Some(ThreadProjection::from_thread(&thread));
                                     self.run_after_function_call_hooks(
-                                        hook_context,
+                                        after_context,
                                         hook_result,
                                         &mut on_event,
                                     )
@@ -545,6 +580,36 @@ impl Agent {
                                             prompt: prompt.clone(),
                                         },
                                     ));
+                                    // A suspended call ends this model iteration. Record explicit
+                                    // tool errors for later calls so the next request has no
+                                    // unmatched assistant tool-call records.
+                                    let skipped_items = calls
+                                        .iter()
+                                        .skip(call_index + 1)
+                                        .map(|skipped_call| {
+                                            let skipped_error =
+                                                "function not executed because a previous function suspended the turn";
+                                            on_event(TurnStreamEvent::State(
+                                                TurnStateEvent::FunctionFailed {
+                                                    call_id: skipped_call.call_id.clone(),
+                                                    name: skipped_call.name.clone(),
+                                                    error: skipped_error.to_string(),
+                                                },
+                                            ));
+                                            TurnItem::new(
+                                                TurnItemSource::Tool,
+                                                TurnItemKind::ToolOutput {
+                                                    call_id: skipped_call.call_id.clone(),
+                                                    name: skipped_call.name.clone(),
+                                                    result: ToolResult::Error {
+                                                        error: skipped_error.to_string(),
+                                                    },
+                                                },
+                                            )
+                                        })
+                                        .collect::<Vec<_>>();
+                                    Self::push_turn_items(&mut thread, &turn_id, skipped_items)?;
+                                    thread = self.store.save(thread).await?;
                                     break 'turn_loop TurnOutcome::WaitingForUser {
                                         request_id,
                                         prompt,
@@ -570,8 +635,11 @@ impl Agent {
                                         )],
                                     )?;
                                     thread = self.store.save(thread).await?;
+                                    let mut after_context = hook_context.clone();
+                                    after_context.projection_after =
+                                        Some(ThreadProjection::from_thread(&thread));
                                     self.run_after_function_call_hooks(
-                                        hook_context,
+                                        after_context,
                                         hook_result,
                                         &mut on_event,
                                     )
@@ -586,6 +654,10 @@ impl Agent {
                                 }
                             }
                         }
+                    }
+                    ModelResponse::AssistantMessage { .. }
+                    | ModelResponse::FunctionCalls { .. } => {
+                        unreachable!("legacy model response variants are normalized above")
                     }
                 }
             }
@@ -609,7 +681,7 @@ impl Agent {
             }));
         }
         Self::emit_turn_token_usage(&mut on_event, turn_token_usage);
-        on_event(TurnStreamEvent::State(TurnStateEvent::TurnCompleted {
+        on_event(TurnStreamEvent::State(TurnStateEvent::TurnFinished {
             outcome: outcome.clone(),
         }));
         Ok(outcome)
@@ -973,6 +1045,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn persists_assistant_text_when_response_also_requests_tools() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(JsonFileThreadStore::new(temp.path()));
+        let agent = agent_with(
+            store.clone(),
+            vec![
+                ModelResponse::Assistant {
+                    text: Some("I will check the goal first.".to_string()),
+                    function_calls: vec![ModelFunctionCall {
+                        call_id: "c1".to_string(),
+                        name: "get_goal".to_string(),
+                        arguments: json!({}),
+                    }],
+                },
+                ModelResponse::Assistant {
+                    text: Some("The goal is not set.".to_string()),
+                    function_calls: Vec::new(),
+                },
+            ],
+        );
+
+        agent.run_turn("t", "check").await.expect("turn");
+        let thread = store.load("t").await.expect("thread");
+        let messages = thread.turns[0]
+            .items
+            .iter()
+            .filter_map(|item| match &item.kind {
+                TurnItemKind::ModelMessage { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            messages,
+            vec!["I will check the goal first.", "The goal is not set."]
+        );
+    }
+
+    #[tokio::test]
     async fn concurrent_turns_for_same_thread_are_serialized() {
         let temp = tempfile::tempdir().expect("tempdir");
         let store = Arc::new(JsonFileThreadStore::new(temp.path()));
@@ -1107,15 +1217,18 @@ mod tests {
         let outcome = agent.run_turn("thread-a", "coffee shop lights").await;
         assert!(matches!(outcome, Ok(TurnOutcome::AssistantMessage { .. })));
 
-        let requests = model.requests.lock().expect("requests");
-        let system = requests[0]
-            .messages
-            .iter()
-            .find_map(|message| match message {
-                crate::projection::ChatMessage::System { content } => Some(content),
-                _ => None,
-            })
-            .expect("system message");
+        let system = {
+            let requests = model.requests.lock().expect("requests");
+            requests[0]
+                .messages
+                .iter()
+                .find_map(|message| match message {
+                    crate::projection::ChatMessage::System { content } => Some(content),
+                    _ => None,
+                })
+                .expect("system message")
+                .clone()
+        };
         assert!(system.contains("<runtime thread=\"thread-a\">query=coffee shop lights</runtime>"));
 
         let thread = store.load("thread-a").await.expect("thread");
@@ -1167,7 +1280,7 @@ mod tests {
         )));
         assert!(events.iter().any(|event| matches!(
             event,
-            TurnStreamEvent::State(TurnStateEvent::TurnCompleted { .. })
+            TurnStreamEvent::State(TurnStateEvent::TurnFinished { .. })
         )));
     }
 
@@ -1216,14 +1329,18 @@ mod tests {
             .expect("turn");
 
         assert!(matches!(outcome, TurnOutcome::AssistantMessage { .. }));
-        let events = events.lock().expect("lock");
-        let usage = events
-            .iter()
-            .find_map(|event| match event {
-                TurnStreamEvent::State(TurnStateEvent::TurnTokenUsage { usage }) => Some(*usage),
-                _ => None,
-            })
-            .expect("usage event");
+        let usage = {
+            let events = events.lock().expect("lock");
+            events
+                .iter()
+                .find_map(|event| match event {
+                    TurnStreamEvent::State(TurnStateEvent::TurnTokenUsage { usage }) => {
+                        Some(*usage)
+                    }
+                    _ => None,
+                })
+                .expect("usage event")
+        };
         assert_eq!(usage.input_tokens, 10);
         assert_eq!(usage.cached_input_tokens, 2);
         assert_eq!(usage.output_tokens, 4);
