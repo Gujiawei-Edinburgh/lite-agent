@@ -120,23 +120,21 @@ impl ModelClient for ChatCompletionsClient {
             }
 
             let mut stream = response.bytes_stream();
-            let mut buffer = String::new();
+            let mut buffer = Vec::new();
             let mut assistant_text = String::new();
             let mut tool_calls = BTreeMap::<usize, PartialToolCall>::new();
 
             while let Some(chunk) = stream.next().await {
                 let chunk = chunk?;
-                buffer.push_str(&String::from_utf8_lossy(&chunk));
-
-                while let Some(frame_end) = buffer.find("\n\n") {
-                    let frame = buffer[..frame_end].to_string();
-                    buffer.drain(..frame_end + 2);
-                    handle_sse_frame(&frame, &mut assistant_text, &mut tool_calls, on_event)
-                        .await?;
-                }
+                buffer.extend_from_slice(&chunk);
+                consume_sse_frames(&mut buffer, &mut assistant_text, &mut tool_calls, on_event)?;
             }
-            if !buffer.trim().is_empty() {
-                handle_sse_frame(&buffer, &mut assistant_text, &mut tool_calls, on_event).await?;
+            consume_sse_frames(&mut buffer, &mut assistant_text, &mut tool_calls, on_event)?;
+            if !buffer.iter().all(u8::is_ascii_whitespace) {
+                let frame = std::str::from_utf8(&buffer).map_err(|error| {
+                    AgentError::Model(format!("invalid UTF-8 in SSE stream: {error}"))
+                })?;
+                handle_sse_frame(frame, &mut assistant_text, &mut tool_calls, on_event)?;
             }
 
             let calls = tool_calls
@@ -334,7 +332,34 @@ impl PartialToolCall {
     }
 }
 
-async fn handle_sse_frame(
+fn consume_sse_frames(
+    buffer: &mut Vec<u8>,
+    assistant_text: &mut String,
+    tool_calls: &mut BTreeMap<usize, PartialToolCall>,
+    on_event: &mut ModelStreamHandler<'_>,
+) -> Result<()> {
+    while let Some((frame_end, delimiter_len)) = find_sse_frame_end(buffer) {
+        let frame = std::str::from_utf8(&buffer[..frame_end])
+            .map_err(|error| AgentError::Model(format!("invalid UTF-8 in SSE stream: {error}")))?;
+        handle_sse_frame(frame, assistant_text, tool_calls, on_event)?;
+        buffer.drain(..frame_end + delimiter_len);
+    }
+    Ok(())
+}
+
+fn find_sse_frame_end(buffer: &[u8]) -> Option<(usize, usize)> {
+    for index in 0..buffer.len() {
+        if buffer.get(index..index + 2) == Some(b"\n\n") {
+            return Some((index, 2));
+        }
+        if buffer.get(index..index + 4) == Some(b"\r\n\r\n") {
+            return Some((index, 4));
+        }
+    }
+    None
+}
+
+fn handle_sse_frame(
     frame: &str,
     assistant_text: &mut String,
     tool_calls: &mut BTreeMap<usize, PartialToolCall>,
@@ -442,7 +467,7 @@ struct OpenAiStreamFunctionDelta {
 
 #[cfg(test)]
 mod tests {
-    use super::{handle_sse_frame, ModelStreamEvent, PartialToolCall};
+    use super::{consume_sse_frames, handle_sse_frame, ModelStreamEvent, PartialToolCall};
     use super::{FunctionSpec, ModelFunctionCall, ModelRequest, OpenAiChatRequest};
     use crate::projection::ChatMessage;
     use serde_json::{json, Value};
@@ -506,7 +531,6 @@ data: [DONE]
         handle_sse_frame(frame, &mut text, &mut calls, &mut |event| {
             deltas.push(event);
         })
-        .await
         .expect("frame");
 
         assert_eq!(text, "hello");
@@ -526,9 +550,7 @@ data: [DONE]
 
 "#;
 
-        handle_sse_frame(frame, &mut text, &mut calls, &mut |_event| {})
-            .await
-            .expect("frame");
+        handle_sse_frame(frame, &mut text, &mut calls, &mut |_event| {}).expect("frame");
 
         let call = calls.remove(&0).expect("call").finish().expect("finish");
         assert_eq!(call.call_id, "call_1");
@@ -550,7 +572,6 @@ data: [DONE]
         handle_sse_frame(frame, &mut text, &mut calls, &mut |event| {
             events.push(event);
         })
-        .await
         .expect("frame");
 
         assert_eq!(events.len(), 1);
@@ -561,5 +582,33 @@ data: [DONE]
         assert_eq!(usage.cached_input_tokens, 3);
         assert_eq!(usage.output_tokens, 4);
         assert_eq!(usage.total_tokens, 14);
+    }
+
+    #[test]
+    fn sse_parser_handles_crlf_and_utf8_split_across_chunks() {
+        let payload = "data: {\"choices\":[{\"delta\":{\"content\":\"你好\"}}]}\r\n\r\n";
+        let bytes = payload.as_bytes();
+        let split = payload.find('你').expect("unicode content") + 1;
+        let mut buffer = Vec::new();
+        let mut text = String::new();
+        let mut calls = BTreeMap::<usize, PartialToolCall>::new();
+        let mut events = Vec::new();
+
+        buffer.extend_from_slice(&bytes[..split]);
+        consume_sse_frames(&mut buffer, &mut text, &mut calls, &mut |event| {
+            events.push(event);
+        })
+        .expect("first chunk");
+        assert!(events.is_empty());
+
+        buffer.extend_from_slice(&bytes[split..]);
+        consume_sse_frames(&mut buffer, &mut text, &mut calls, &mut |event| {
+            events.push(event);
+        })
+        .expect("second chunk");
+
+        assert!(buffer.is_empty());
+        assert_eq!(text, "你好");
+        assert_eq!(events.len(), 1);
     }
 }

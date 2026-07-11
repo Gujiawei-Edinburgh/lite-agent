@@ -516,13 +516,15 @@ impl Agent {
                                 Ok(FunctionExecution::Completed {
                                     output,
                                     thread_update,
-                                    mut extra_items,
                                 }) => {
-                                    Self::apply_thread_update(&mut thread, thread_update);
+                                    let update_item =
+                                        Self::apply_thread_update(&mut thread, thread_update);
                                     let hook_result = FunctionCallHookResult::Completed {
                                         output: output.clone(),
                                     };
-                                    extra_items.push(TurnItem::new(
+                                    let mut func_items =
+                                        update_item.into_iter().collect::<Vec<_>>();
+                                    func_items.push(TurnItem::new(
                                         TurnItemSource::Tool,
                                         TurnItemKind::ToolOutput {
                                             call_id: call_id.clone(),
@@ -530,7 +532,7 @@ impl Agent {
                                             result: ToolResult::Success { output },
                                         },
                                     ));
-                                    Self::push_turn_items(&mut thread, &turn_id, extra_items)?;
+                                    Self::push_turn_items(&mut thread, &turn_id, func_items)?;
                                     thread = self.store.save(thread).await?;
                                     let mut after_context = hook_context.clone();
                                     after_context.projection_after =
@@ -550,15 +552,17 @@ impl Agent {
                                     prompt,
                                     output,
                                     thread_update,
-                                    mut extra_items,
                                 }) => {
-                                    Self::apply_thread_update(&mut thread, thread_update);
+                                    let update_item =
+                                        Self::apply_thread_update(&mut thread, thread_update);
                                     let hook_result = FunctionCallHookResult::WaitingForUser {
                                         request_id: request_id.clone(),
                                         prompt: prompt.clone(),
                                         output: output.clone(),
                                     };
-                                    extra_items.push(TurnItem::new(
+                                    let mut func_items =
+                                        update_item.into_iter().collect::<Vec<_>>();
+                                    func_items.push(TurnItem::new(
                                         TurnItemSource::Tool,
                                         TurnItemKind::ToolOutput {
                                             call_id: call_id.clone(),
@@ -566,7 +570,14 @@ impl Agent {
                                             result: ToolResult::Success { output },
                                         },
                                     ));
-                                    Self::push_turn_items(&mut thread, &turn_id, extra_items)?;
+                                    func_items.push(TurnItem::new(
+                                        TurnItemSource::Runtime,
+                                        TurnItemKind::UserInputRequested {
+                                            request_id: request_id.clone(),
+                                            prompt: prompt.clone(),
+                                        },
+                                    ));
+                                    Self::push_turn_items(&mut thread, &turn_id, func_items)?;
                                     Self::set_turn_status(
                                         &mut thread,
                                         &turn_id,
@@ -821,9 +832,19 @@ impl Agent {
         }
     }
 
-    fn apply_thread_update(thread: &mut Thread, update: Option<ThreadUpdate>) {
-        if let Some(ThreadUpdate::Goal(goal)) = update {
-            thread.goal = Some(goal);
+    fn apply_thread_update(thread: &mut Thread, update: Option<ThreadUpdate>) -> Option<TurnItem> {
+        match update {
+            Some(ThreadUpdate::Goal(goal)) => {
+                let previous = thread.goal.replace(goal.clone());
+                Some(TurnItem::new(
+                    TurnItemSource::Runtime,
+                    TurnItemKind::GoalUpdated {
+                        previous,
+                        current: goal,
+                    },
+                ))
+            }
+            None => None,
         }
     }
 

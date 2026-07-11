@@ -1,6 +1,6 @@
 use crate::agent_loop::TurnAbortSignal;
 use crate::error::{AgentError, Result};
-use crate::events::{new_id, GoalState, GoalStatus, TurnItem, TurnItemKind, TurnItemSource};
+use crate::events::{new_id, GoalState, GoalStatus};
 use crate::model::FunctionSpec;
 use crate::projection::ThreadProjection;
 use serde::Deserialize;
@@ -29,14 +29,12 @@ pub enum FunctionExecution {
     Completed {
         output: Value,
         thread_update: Option<ThreadUpdate>,
-        extra_items: Vec<TurnItem>,
     },
     WaitingForUser {
         request_id: String,
         prompt: String,
         output: Value,
         thread_update: Option<ThreadUpdate>,
-        extra_items: Vec<TurnItem>,
     },
 }
 
@@ -149,7 +147,6 @@ impl AgentFunction for GetGoal {
             Ok(FunctionExecution::Completed {
                 output: json!({ "goal": context.projection.goal }),
                 thread_update: None,
-                extra_items: Vec::new(),
             })
         })
     }
@@ -188,7 +185,7 @@ impl AgentFunction for UpdateGoal {
     fn call<'a>(
         &'a self,
         args: Value,
-        context: FunctionContext,
+        _context: FunctionContext,
     ) -> Pin<Box<dyn Future<Output = Result<FunctionExecution>> + Send + 'a>> {
         Box::pin(async move {
             let parsed: UpdateGoalArgs = serde_json::from_value(args).map_err(|error| {
@@ -202,18 +199,9 @@ impl AgentFunction for UpdateGoal {
                 status: parsed.status,
                 notes: parsed.notes,
             };
-            let item = TurnItem::new(
-                TurnItemSource::Runtime,
-                TurnItemKind::GoalUpdated {
-                    previous: context.projection.goal,
-                    current: current.clone(),
-                },
-            );
-
             Ok(FunctionExecution::Completed {
                 output: json!({ "goal": current }),
                 thread_update: Some(ThreadUpdate::Goal(current)),
-                extra_items: vec![item],
             })
         })
     }
@@ -255,14 +243,6 @@ impl AgentFunction for AskUser {
                 }
             })?;
             let request_id = new_id("req");
-            let item = TurnItem::new(
-                TurnItemSource::Runtime,
-                TurnItemKind::UserInputRequested {
-                    request_id: request_id.clone(),
-                    prompt: parsed.prompt.clone(),
-                },
-            );
-
             Ok(FunctionExecution::WaitingForUser {
                 request_id: request_id.clone(),
                 prompt: parsed.prompt.clone(),
@@ -272,7 +252,6 @@ impl AgentFunction for AskUser {
                     "status": "waiting_for_user"
                 }),
                 thread_update: None,
-                extra_items: vec![item],
             })
         })
     }
@@ -280,7 +259,7 @@ impl AgentFunction for AskUser {
 
 #[cfg(test)]
 mod tests {
-    use crate::events::{GoalStatus, Thread, TurnItemKind};
+    use crate::events::{GoalStatus, Thread};
     use crate::projection::ThreadProjection;
 
     use super::{builtin_registry, FunctionContext, FunctionExecution, ThreadUpdate};
@@ -304,21 +283,12 @@ mod tests {
             .await
             .expect("call");
 
-        let FunctionExecution::Completed {
-            thread_update,
-            extra_items,
-            ..
-        } = execution
-        else {
+        let FunctionExecution::Completed { thread_update, .. } = execution else {
             panic!("expected completion");
         };
         assert!(matches!(
             thread_update,
             Some(ThreadUpdate::Goal(goal)) if goal.status == GoalStatus::Active
-        ));
-        assert!(matches!(
-            extra_items[0].kind,
-            TurnItemKind::GoalUpdated { .. }
         ));
     }
 
@@ -340,18 +310,9 @@ mod tests {
             .await
             .expect("call");
 
-        let FunctionExecution::WaitingForUser {
-            prompt,
-            extra_items,
-            ..
-        } = execution
-        else {
+        let FunctionExecution::WaitingForUser { prompt, .. } = execution else {
             panic!("expected waiting");
         };
         assert_eq!(prompt, "Which thread?");
-        assert!(matches!(
-            extra_items[0].kind,
-            TurnItemKind::UserInputRequested { .. }
-        ));
     }
 }

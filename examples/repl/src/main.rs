@@ -113,7 +113,6 @@ fn exec_command_function(command_cwd: PathBuf) -> impl lite_agent_core::function
                 Ok(FunctionExecution::Completed {
                     output,
                     thread_update: None,
-                    extra_items: Vec::new(),
                 })
             }
         },
