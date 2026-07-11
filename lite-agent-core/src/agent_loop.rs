@@ -424,16 +424,18 @@ impl Agent {
                             on_event(TurnStreamEvent::Model(TurnModelEvent::AssistantMessage {
                                 text: text.clone(),
                             }));
-                            Self::push_turn_items(
-                                &mut thread,
-                                &session.active_turn_id,
-                                vec![TurnItem::new(
-                                    TurnItemSource::Model,
-                                    TurnItemKind::ModelMessage { text: text.clone() },
-                                )],
-                            )?;
-                            thread = self.commit_thread(thread).await?;
                         }
+                        Self::push_turn_items(
+                            &mut thread,
+                            &session.active_turn_id,
+                            vec![TurnItem::new(
+                                TurnItemSource::Model,
+                                TurnItemKind::ModelResponse {
+                                    text: text.clone(),
+                                    function_calls: function_calls.clone(),
+                                },
+                            )],
+                        )?;
                         if function_calls.is_empty() {
                             let text = text.unwrap_or_default();
                             Self::set_turn_status(
@@ -441,6 +443,7 @@ impl Agent {
                                 &session.active_turn_id,
                                 TurnStatus::Completed,
                             )?;
+                            thread = self.commit_thread(thread).await?;
                             break 'turn_loop TurnOutcome::AssistantMessage { text };
                         }
                         let calls = function_calls;
@@ -456,20 +459,6 @@ impl Agent {
                                 calls: calls.clone(),
                             },
                         ));
-                        let call_items = calls
-                            .iter()
-                            .map(|call| {
-                                TurnItem::new(
-                                    TurnItemSource::Model,
-                                    TurnItemKind::ModelFunctionCall {
-                                        call_id: call.call_id.clone(),
-                                        name: call.name.clone(),
-                                        arguments: call.arguments.clone(),
-                                    },
-                                )
-                            })
-                            .collect();
-                        Self::push_turn_items(&mut thread, &session.active_turn_id, call_items)?;
                         thread = self.commit_thread(thread).await?;
 
                         for (call_index, call) in calls.iter().enumerate() {
@@ -1113,7 +1102,7 @@ mod tests {
             .items
             .iter()
             .filter_map(|item| match &item.kind {
-                TurnItemKind::ModelMessage { text } => Some(text.as_str()),
+                TurnItemKind::ModelResponse { text, .. } => text.as_deref(),
                 _ => None,
             })
             .collect::<Vec<_>>();

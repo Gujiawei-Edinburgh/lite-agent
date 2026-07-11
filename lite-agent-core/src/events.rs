@@ -1,3 +1,4 @@
+use crate::model::ModelFunctionCall;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fmt;
@@ -173,13 +174,9 @@ pub enum TurnItemKind {
         text: String,
         response_to: Option<String>,
     },
-    ModelMessage {
-        text: String,
-    },
-    ModelFunctionCall {
-        call_id: String,
-        name: String,
-        arguments: Value,
+    ModelResponse {
+        text: Option<String>,
+        function_calls: Vec<ModelFunctionCall>,
     },
     ToolOutput {
         call_id: String,

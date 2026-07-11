@@ -62,11 +62,9 @@ impl ThreadProjection {
         };
 
         for turn in &thread.turns {
-            let mut pending_tool_calls = Vec::new();
             for item in &turn.items {
                 match &item.kind {
                     TurnItemKind::UserInput { text, response_to } => {
-                        flush_tool_calls(&mut projection, &mut pending_tool_calls);
                         projection.conversation.push(ChatMessage::User {
                             content: text.clone(),
                         });
@@ -82,23 +80,16 @@ impl ThreadProjection {
                             projection.pending_suspension = None;
                         }
                     }
-                    TurnItemKind::ModelMessage { text } => {
-                        flush_tool_calls(&mut projection, &mut pending_tool_calls);
-                        projection.last_assistant_message = Some(text.clone());
-                        projection.conversation.push(ChatMessage::Assistant {
-                            content: Some(text.clone()),
-                            tool_calls: Vec::new(),
-                        });
-                    }
-                    TurnItemKind::ModelFunctionCall {
-                        call_id,
-                        name,
-                        arguments,
+                    TurnItemKind::ModelResponse {
+                        text,
+                        function_calls,
                     } => {
-                        pending_tool_calls.push(ModelFunctionCall {
-                            call_id: call_id.clone(),
-                            name: name.clone(),
-                            arguments: arguments.clone(),
+                        if let Some(text) = text {
+                            projection.last_assistant_message = Some(text.clone());
+                        }
+                        projection.conversation.push(ChatMessage::Assistant {
+                            content: text.clone(),
+                            tool_calls: function_calls.clone(),
                         });
                     }
                     TurnItemKind::ToolOutput {
@@ -107,7 +98,6 @@ impl ThreadProjection {
                         result,
                     } => match result {
                         ToolResult::Success { output } => {
-                            flush_tool_calls(&mut projection, &mut pending_tool_calls);
                             projection
                                 .completed_function_results
                                 .push(CompletedFunctionCall {
@@ -122,7 +112,6 @@ impl ThreadProjection {
                             });
                         }
                         ToolResult::Error { error } => {
-                            flush_tool_calls(&mut projection, &mut pending_tool_calls);
                             projection.conversation.push(ChatMessage::Tool {
                                 tool_call_id: call_id.clone(),
                                 name: name.clone(),
@@ -131,39 +120,21 @@ impl ThreadProjection {
                         }
                     },
                     TurnItemKind::SuspensionCreated { suspension } => {
-                        flush_tool_calls(&mut projection, &mut pending_tool_calls);
                         projection.pending_suspension = Some(PendingSuspension {
                             suspension: suspension.clone(),
                             turn_id: turn.id.clone(),
                         });
                     }
                     TurnItemKind::GoalUpdated { current, .. } => {
-                        flush_tool_calls(&mut projection, &mut pending_tool_calls);
                         projection.goal = Some(current.clone());
                     }
-                    TurnItemKind::TurnFailed { .. } | TurnItemKind::TurnAborted { .. } => {
-                        flush_tool_calls(&mut projection, &mut pending_tool_calls);
-                    }
+                    TurnItemKind::TurnFailed { .. } | TurnItemKind::TurnAborted { .. } => {}
                 }
             }
-            flush_tool_calls(&mut projection, &mut pending_tool_calls);
         }
 
         projection
     }
-}
-
-fn flush_tool_calls(
-    projection: &mut ThreadProjection,
-    pending_tool_calls: &mut Vec<ModelFunctionCall>,
-) {
-    if pending_tool_calls.is_empty() {
-        return;
-    }
-    projection.conversation.push(ChatMessage::Assistant {
-        content: None,
-        tool_calls: std::mem::take(pending_tool_calls),
-    });
 }
 
 #[cfg(test)]
@@ -172,6 +143,7 @@ mod tests {
         GoalState, GoalStatus, Thread, ToolResult, Turn, TurnItem, TurnItemKind, TurnItemSource,
         TurnStatus,
     };
+    use crate::model::ModelFunctionCall;
     use serde_json::json;
 
     use super::{ChatMessage, ThreadProjection};
@@ -231,10 +203,13 @@ mod tests {
         let mut turn = Turn::new();
         turn.push_item(TurnItem::new(
             TurnItemSource::Model,
-            TurnItemKind::ModelFunctionCall {
-                call_id: "call_1".to_string(),
-                name: "exec_command".to_string(),
-                arguments: json!({ "cmd": "ls" }),
+            TurnItemKind::ModelResponse {
+                text: None,
+                function_calls: vec![ModelFunctionCall {
+                    call_id: "call_1".to_string(),
+                    name: "exec_command".to_string(),
+                    arguments: json!({ "cmd": "ls" }),
+                }],
             },
         ));
         turn.push_item(TurnItem::new(
@@ -266,16 +241,20 @@ mod tests {
     fn groups_consecutive_function_calls_into_one_assistant_message() {
         let mut thread = Thread::new("t");
         let mut turn = Turn::new();
-        for call_id in ["call_1", "call_2"] {
-            turn.push_item(TurnItem::new(
-                TurnItemSource::Model,
-                TurnItemKind::ModelFunctionCall {
-                    call_id: call_id.to_string(),
-                    name: "exec_command".to_string(),
-                    arguments: json!({ "cmd": "ls" }),
-                },
-            ));
-        }
+        turn.push_item(TurnItem::new(
+            TurnItemSource::Model,
+            TurnItemKind::ModelResponse {
+                text: None,
+                function_calls: ["call_1", "call_2"]
+                    .into_iter()
+                    .map(|call_id| ModelFunctionCall {
+                        call_id: call_id.to_string(),
+                        name: "exec_command".to_string(),
+                        arguments: json!({ "cmd": "ls" }),
+                    })
+                    .collect(),
+            },
+        ));
         thread.turns.push(turn);
 
         let projection = ThreadProjection::from_thread(&thread);

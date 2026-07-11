@@ -248,8 +248,9 @@ mod tests {
         let turn_id = turn.id.clone();
         turn.push_item(TurnItem::new(
             TurnItemSource::Model,
-            TurnItemKind::ModelMessage {
-                text: "hello".to_string(),
+            TurnItemKind::ModelResponse {
+                text: Some("hello".to_string()),
+                function_calls: Vec::new(),
             },
         ));
 
