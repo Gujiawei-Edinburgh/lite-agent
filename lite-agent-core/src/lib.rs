@@ -14,8 +14,8 @@ pub use agent_loop::{
     TurnAbortHandle, TurnAbortSignal, TurnModelEvent, TurnOutcome, TurnStateEvent, TurnStreamEvent,
 };
 pub use context::{
-    ApproximateTokenEstimator, CompactingContextBuilder, ContextBuildInput, ContextBuilder,
-    ContextCompactor, TokenEstimator,
+    ApproximateTokenEstimator, CompactingContextBuilder, CompactionInput, ContextBuildInput,
+    ContextBuildOutput, ContextBuilder, ContextCompactor, TokenEstimator,
 };
 pub use error::{AgentError, Result};
 pub use events::{
@@ -29,4 +29,4 @@ pub use functions::{
 pub use logging::{init_file_logging, LoggingGuard};
 pub use model::{ChatCompletionsClient, FunctionSpec, ModelClient, ModelConfig};
 pub use projection::{ChatMessage, ThreadProjection};
-pub use store::{JsonFileThreadStore, ThreadStore};
+pub use store::{JsonFileThreadStore, ThreadContextCache, ThreadStore};

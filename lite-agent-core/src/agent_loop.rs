@@ -7,7 +7,7 @@ use crate::events::{
 use crate::functions::{FunctionContext, FunctionExecution, FunctionRegistry, ThreadUpdate};
 use crate::model::{ModelClient, ModelRequest, ModelResponse, ModelStreamEvent};
 use crate::projection::ThreadProjection;
-use crate::store::ThreadStore;
+use crate::store::{ThreadContextCache, ThreadStore};
 use serde_json::Value;
 use std::future::Future;
 use std::pin::Pin;
@@ -353,10 +353,16 @@ impl Agent {
         let outcome = 'turn_loop: {
             for iteration in 0..self.config.max_model_iterations {
                 let session = Session::from_thread(&thread, turn_id.clone());
-                let request = self.model_request_from_projection(
-                    session.projection.clone(),
-                    runtime_context.as_deref(),
-                )?;
+                let cached_context = self.store.load_context_cache(thread_id).await?;
+                let request = self
+                    .model_request_from_projection(
+                        thread_id,
+                        thread.version,
+                        session.projection.clone(),
+                        runtime_context.as_deref(),
+                        cached_context.as_ref(),
+                    )
+                    .await?;
                 on_event(TurnStreamEvent::Model(TurnModelEvent::RequestStarted {
                     iteration,
                 }));
@@ -784,17 +790,30 @@ impl Agent {
         self.store.commit(thread, expected_version).await
     }
 
-    fn model_request_from_projection(
+    async fn model_request_from_projection(
         &self,
+        thread_id: &str,
+        thread_version: u64,
         projection: ThreadProjection,
         runtime_context: Option<&str>,
+        cached_context: Option<&ThreadContextCache>,
     ) -> Result<ModelRequest> {
-        Ok(ModelRequest {
-            messages: self.context_builder.build(ContextBuildInput {
+        let context = self
+            .context_builder
+            .build(ContextBuildInput {
+                thread_id,
+                thread_version,
                 projection: &projection,
                 system_prompt: &self.config.system_prompt,
                 runtime_context,
-            })?,
+                cached_context,
+            })
+            .await?;
+        if let Some(cache) = context.cache {
+            self.store.save_context_cache(cache).await?;
+        }
+        Ok(ModelRequest {
+            messages: context.messages,
             functions: self.function_registry.specs(),
         })
     }
@@ -1186,8 +1205,8 @@ mod tests {
         )));
     }
 
-    #[test]
-    fn model_request_includes_current_time_context() {
+    #[tokio::test]
+    async fn model_request_includes_current_time_context() {
         let temp = tempfile::tempdir().expect("tempdir");
         let store = Arc::new(JsonFileThreadStore::open(temp.path()).expect("store"));
         let agent = agent_with(
@@ -1198,7 +1217,8 @@ mod tests {
         );
 
         let request = agent
-            .model_request_from_projection(Default::default(), None)
+            .model_request_from_projection("t", 0, Default::default(), None, None)
+            .await
             .expect("context");
         let Some(crate::projection::ChatMessage::System { content }) = request.messages.first()
         else {

@@ -1,11 +1,11 @@
 use lite_agent_core::functions::{FunctionExecution, SimpleFunction};
-use lite_agent_core::model::FunctionSpec;
+use lite_agent_core::model::{FunctionSpec, ModelRequest, ModelResponse};
 use lite_agent_core::FunctionContext;
 use lite_agent_core::{
     builtin_registry, init_file_logging, turn_abort_pair, Agent, AgentConfig,
-    ChatCompletionsClient, ChatMessage, CompactingContextBuilder, ContextCompactor,
-    FunctionRegistry, JsonFileThreadStore, ModelConfig, Result, ThreadStore, TurnModelEvent,
-    TurnOutcome, TurnStateEvent, TurnStreamEvent,
+    ChatCompletionsClient, ChatMessage, CompactingContextBuilder, CompactionInput,
+    ContextCompactor, FunctionRegistry, JsonFileThreadStore, ModelClient, ModelConfig, Result,
+    ThreadStore, TurnModelEvent, TurnOutcome, TurnStateEvent, TurnStreamEvent,
 };
 use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
@@ -55,12 +55,14 @@ async fn main() -> lite_agent_core::Result<()> {
     let agent = Agent::new(
         AgentConfig::default(),
         store.clone(),
-        model_client,
+        model_client.clone(),
         example_registry(args.command_cwd),
     )
-    .with_context_builder(
-        CompactingContextBuilder::default().with_compactor(ExampleContextCompactor),
-    );
+    .with_context_builder(CompactingContextBuilder::default().with_compactor(
+        ExampleContextCompactor {
+            model: model_client,
+        },
+    ));
 
     run_repl(agent, store, thread_id).await
 }
@@ -71,40 +73,54 @@ fn example_registry(command_cwd: PathBuf) -> FunctionRegistry {
     registry
 }
 
-struct ExampleContextCompactor;
-
-impl ContextCompactor for ExampleContextCompactor {
-    fn compact(&self, omitted: &[ChatMessage]) -> Result<Option<ChatMessage>> {
-        if omitted.is_empty() {
-            return Ok(None);
-        }
-        let mut summary = String::from(
-            "Earlier conversation context was compacted. These are approximate excerpts:\n",
-        );
-        for message in omitted {
-            let excerpt = match message {
-                ChatMessage::User { content } => format!("user: {content}"),
-                ChatMessage::Assistant { content, .. } => {
-                    format!("assistant: {}", content.as_deref().unwrap_or("[tool call]"))
-                }
-                ChatMessage::Tool { name, content, .. } => format!("tool {name}: {content}"),
-                ChatMessage::System { content } => format!("system: {content}"),
-            };
-            summary.push_str(&truncate_excerpt(&excerpt));
-            summary.push('\n');
-        }
-        Ok(Some(ChatMessage::System { content: summary }))
-    }
+struct ExampleContextCompactor {
+    model: Arc<dyn ModelClient>,
 }
 
-fn truncate_excerpt(value: &str) -> String {
-    const MAX_CHARS: usize = 240;
-    if value.chars().count() <= MAX_CHARS {
-        return value.to_string();
+impl ContextCompactor for ExampleContextCompactor {
+    fn compact<'a>(
+        &'a self,
+        input: CompactionInput,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String>> + Send + 'a>> {
+        Box::pin(async move {
+            let mut prompt = String::from(
+                "Summarize the earlier agent conversation for future continuity. Preserve user goals, decisions, constraints, unresolved questions, and important tool results. Be concise and factual.\n\n",
+            );
+            if let Some(previous_summary) = input.previous_summary {
+                prompt.push_str("Previous summary:\n");
+                prompt.push_str(&previous_summary);
+                prompt.push_str("\n\nNew omitted messages:\n");
+            }
+            prompt.push_str(&serde_json::to_string(&input.messages)?);
+
+            let mut handler = |_event| {};
+            let response = self
+                .model
+                .stream_complete(
+                    ModelRequest {
+                        messages: vec![
+                            ChatMessage::System {
+                                content: "You produce compact durable context summaries."
+                                    .to_string(),
+                            },
+                            ChatMessage::User { content: prompt },
+                        ],
+                        functions: Vec::new(),
+                    },
+                    &mut handler,
+                )
+                .await?;
+            match response {
+                ModelResponse::Assistant {
+                    text: Some(text), ..
+                }
+                | ModelResponse::AssistantMessage { text } => Ok(text),
+                _ => Err(lite_agent_core::AgentError::Model(
+                    "context compactor model returned no summary".to_string(),
+                )),
+            }
+        })
     }
-    let mut excerpt: String = value.chars().take(MAX_CHARS).collect();
-    excerpt.push_str("...");
-    excerpt
 }
 
 fn exec_command_function(command_cwd: PathBuf) -> impl lite_agent_core::functions::AgentFunction {

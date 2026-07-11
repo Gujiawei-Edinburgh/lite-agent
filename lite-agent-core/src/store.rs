@@ -12,6 +12,15 @@ use tokio::sync::Mutex as AsyncMutex;
 
 pub type SessionLock = Arc<AsyncMutex<()>>;
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct ThreadContextCache {
+    pub thread_id: String,
+    pub source_version: u64,
+    pub policy_version: String,
+    pub covered_message_count: usize,
+    pub summary: String,
+}
+
 pub trait ThreadStore: Send + Sync {
     /// Load one durable thread snapshot.
     fn load<'a>(
@@ -26,6 +35,16 @@ pub trait ThreadStore: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<Thread>> + Send + 'a>>;
 
     fn session_lock(&self, thread_id: &str) -> SessionLock;
+
+    fn load_context_cache<'a>(
+        &'a self,
+        thread_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<ThreadContextCache>>> + Send + 'a>>;
+
+    fn save_context_cache<'a>(
+        &'a self,
+        cache: ThreadContextCache,
+    ) -> Pin<Box<dyn Future<Output = Result<ThreadContextCache>> + Send + 'a>>;
 }
 
 /// Single-process JSON persistence intended for local development and examples.
@@ -84,6 +103,12 @@ impl JsonFileThreadStore {
             .join(format!("{thread_id}.json"))
     }
 
+    fn context_cache_path(&self, thread_id: &str) -> PathBuf {
+        self.state_dir
+            .join("context-cache")
+            .join(format!("{thread_id}.json"))
+    }
+
     fn validate_thread_id(thread_id: &str) -> Result<()> {
         if thread_id.is_empty()
             || thread_id == "."
@@ -108,6 +133,19 @@ impl JsonFileThreadStore {
         let raw = serde_json::to_string_pretty(thread)?;
         let temporary_path =
             path.with_extension(format!("json.{}.tmp", crate::events::new_id("write")));
+        fs::write(&temporary_path, raw).await?;
+        fs::rename(temporary_path, path).await?;
+        Ok(())
+    }
+
+    async fn write_context_cache(&self, cache: &ThreadContextCache) -> Result<()> {
+        let path = self.context_cache_path(&cache.thread_id);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).await?;
+        }
+        let raw = serde_json::to_string_pretty(cache)?;
+        let temporary_path =
+            path.with_extension(format!("json.{}.tmp", crate::events::new_id("cache")));
         fs::write(&temporary_path, raw).await?;
         fs::rename(temporary_path, path).await?;
         Ok(())
@@ -168,13 +206,39 @@ impl ThreadStore for JsonFileThreadStore {
             .or_insert_with(|| Arc::new(AsyncMutex::new(())))
             .clone()
     }
+
+    fn load_context_cache<'a>(
+        &'a self,
+        thread_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<ThreadContextCache>>> + Send + 'a>> {
+        Box::pin(async move {
+            Self::validate_thread_id(thread_id)?;
+            match fs::read_to_string(self.context_cache_path(thread_id)).await {
+                Ok(raw) => Ok(Some(serde_json::from_str(&raw)?)),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(error) => Err(error.into()),
+            }
+        })
+    }
+
+    fn save_context_cache<'a>(
+        &'a self,
+        cache: ThreadContextCache,
+    ) -> Pin<Box<dyn Future<Output = Result<ThreadContextCache>> + Send + 'a>> {
+        Box::pin(async move {
+            Self::validate_thread_id(&cache.thread_id)?;
+            let _commit_guard = self.commit_lock.lock().await;
+            self.write_context_cache(&cache).await?;
+            Ok(cache)
+        })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use crate::events::{Thread, Turn, TurnItem, TurnItemKind, TurnItemSource, TurnStatus};
 
-    use super::{JsonFileThreadStore, ThreadStore};
+    use super::{JsonFileThreadStore, ThreadContextCache, ThreadStore};
 
     #[tokio::test]
     async fn round_trips_thread_with_turn_items() {
@@ -282,5 +346,26 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn round_trips_context_cache_separately_from_thread() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = JsonFileThreadStore::open(temp.path()).expect("store");
+        let cache = ThreadContextCache {
+            thread_id: "t1".to_string(),
+            source_version: 4,
+            policy_version: "compact-v1".to_string(),
+            covered_message_count: 12,
+            summary: "Earlier context".to_string(),
+        };
+        store
+            .save_context_cache(cache.clone())
+            .await
+            .expect("save cache");
+        assert_eq!(
+            store.load_context_cache("t1").await.expect("load cache"),
+            Some(cache)
+        );
     }
 }
