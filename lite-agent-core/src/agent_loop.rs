@@ -1,7 +1,7 @@
 use crate::error::{AgentError, Result};
 use crate::events::{
-    Thread, TokenUsage, ToolResult, Turn, TurnId, TurnItem, TurnItemKind, TurnItemSource,
-    TurnStatus,
+    Suspension, Thread, TokenUsage, ToolResult, Turn, TurnId, TurnItem, TurnItemKind,
+    TurnItemSource, TurnStatus,
 };
 use crate::functions::{FunctionContext, FunctionExecution, FunctionRegistry, ThreadUpdate};
 use crate::model::{ModelClient, ModelRequest, ModelResponse, ModelStreamEvent};
@@ -63,7 +63,7 @@ impl Default for AgentConfig {
 #[derive(Debug, Clone, PartialEq)]
 pub enum TurnOutcome {
     AssistantMessage { text: String },
-    WaitingForUser { request_id: String, prompt: String },
+    Suspended { suspension: Suspension },
     Failed { error: String },
     Aborted { reason: String },
 }
@@ -97,9 +97,8 @@ pub enum TurnStateEvent {
         name: String,
         error: String,
     },
-    WaitingForUser {
-        request_id: String,
-        prompt: String,
+    Suspended {
+        suspension: Suspension,
     },
     TurnFinished {
         outcome: TurnOutcome,
@@ -183,9 +182,8 @@ pub enum FunctionCallHookResult {
     Completed {
         output: Value,
     },
-    WaitingForUser {
-        request_id: String,
-        prompt: String,
+    Suspended {
+        suspension: Suspension,
         output: Value,
     },
     Failed {
@@ -323,8 +321,8 @@ impl Agent {
             Err(error) => return Err(error),
         };
         let response_to = ThreadProjection::from_thread(&thread)
-            .pending_user_input_request
-            .map(|request| request.request_id);
+            .pending_suspension
+            .map(|suspension| suspension.suspension.id);
 
         let mut turn = Turn::new();
         let turn_id = turn.id.clone();
@@ -547,17 +545,15 @@ impl Agent {
                                         TurnStateEvent::FunctionCompleted { call_id, name },
                                     ));
                                 }
-                                Ok(FunctionExecution::WaitingForUser {
-                                    request_id,
-                                    prompt,
+                                Ok(FunctionExecution::Suspended {
+                                    suspension,
                                     output,
                                     thread_update,
                                 }) => {
                                     let update_item =
                                         Self::apply_thread_update(&mut thread, thread_update);
-                                    let hook_result = FunctionCallHookResult::WaitingForUser {
-                                        request_id: request_id.clone(),
-                                        prompt: prompt.clone(),
+                                    let hook_result = FunctionCallHookResult::Suspended {
+                                        suspension: suspension.clone(),
                                         output: output.clone(),
                                     };
                                     let mut func_items =
@@ -572,16 +568,15 @@ impl Agent {
                                     ));
                                     func_items.push(TurnItem::new(
                                         TurnItemSource::Runtime,
-                                        TurnItemKind::UserInputRequested {
-                                            request_id: request_id.clone(),
-                                            prompt: prompt.clone(),
+                                        TurnItemKind::SuspensionCreated {
+                                            suspension: suspension.clone(),
                                         },
                                     ));
                                     Self::push_turn_items(&mut thread, &turn_id, func_items)?;
                                     Self::set_turn_status(
                                         &mut thread,
                                         &turn_id,
-                                        TurnStatus::WaitingForUser,
+                                        TurnStatus::Suspended,
                                     )?;
                                     thread = self.store.save(thread).await?;
                                     let mut after_context = hook_context.clone();
@@ -596,12 +591,9 @@ impl Agent {
                                     on_event(TurnStreamEvent::State(
                                         TurnStateEvent::FunctionCompleted { call_id, name },
                                     ));
-                                    on_event(TurnStreamEvent::State(
-                                        TurnStateEvent::WaitingForUser {
-                                            request_id: request_id.clone(),
-                                            prompt: prompt.clone(),
-                                        },
-                                    ));
+                                    on_event(TurnStreamEvent::State(TurnStateEvent::Suspended {
+                                        suspension: suspension.clone(),
+                                    }));
                                     // A suspended call ends this model iteration. Record explicit
                                     // tool errors for later calls so the next request has no
                                     // unmatched assistant tool-call records.
@@ -632,10 +624,7 @@ impl Agent {
                                         .collect::<Vec<_>>();
                                     Self::push_turn_items(&mut thread, &turn_id, skipped_items)?;
                                     thread = self.store.save(thread).await?;
-                                    break 'turn_loop TurnOutcome::WaitingForUser {
-                                        request_id,
-                                        prompt,
-                                    };
+                                    break 'turn_loop TurnOutcome::Suspended { suspension };
                                 }
                                 Err(error) => {
                                     let error_text = error.to_string();
@@ -1057,7 +1046,7 @@ mod tests {
             Box::pin(async move {
                 let result_label = match result {
                     FunctionCallHookResult::Completed { .. } => "completed",
-                    FunctionCallHookResult::WaitingForUser { .. } => "waiting",
+                    FunctionCallHookResult::Suspended { .. } => "waiting",
                     FunctionCallHookResult::Failed { .. } => "failed",
                 };
                 self.events.lock().expect("events").push(format!(
@@ -1459,13 +1448,13 @@ mod tests {
         );
 
         let outcome = agent.run_turn("t", "compare").await.expect("turn");
-        assert!(matches!(outcome, TurnOutcome::WaitingForUser { .. }));
+        assert!(matches!(outcome, TurnOutcome::Suspended { .. }));
         let thread = store.load("t").await.expect("thread");
-        assert_eq!(thread.turns[0].status, TurnStatus::WaitingForUser);
+        assert_eq!(thread.turns[0].status, TurnStatus::Suspended);
         assert!(thread.turns[0]
             .items
             .iter()
-            .any(|item| matches!(item.kind, TurnItemKind::UserInputRequested { .. })));
+            .any(|item| matches!(item.kind, TurnItemKind::SuspensionCreated { .. })));
     }
 
     #[tokio::test]

@@ -128,7 +128,7 @@ impl Default for Turn {
 #[serde(rename_all = "snake_case")]
 pub enum TurnStatus {
     Running,
-    WaitingForUser,
+    Suspended,
     Completed,
     Failed,
     Aborted,
@@ -183,6 +183,10 @@ pub enum TurnItemKind {
         name: String,
         result: ToolResult,
     },
+    SuspensionCreated {
+        suspension: Suspension,
+    },
+    /// Legacy record retained for backwards-compatible thread loading.
     UserInputRequested {
         request_id: String,
         prompt: String,
@@ -197,6 +201,24 @@ pub enum TurnItemKind {
     TurnAborted {
         reason: String,
     },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SuspensionKind {
+    UserInput,
+    HumanApproval,
+    CredentialRequired,
+    Webhook,
+    LongRunningJob,
+    Custom(String),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Suspension {
+    pub id: String,
+    pub kind: SuspensionKind,
+    pub payload: Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

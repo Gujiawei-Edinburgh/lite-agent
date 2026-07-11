@@ -1,6 +1,6 @@
 use crate::agent_loop::TurnAbortSignal;
 use crate::error::{AgentError, Result};
-use crate::events::{new_id, GoalState, GoalStatus};
+use crate::events::{new_id, GoalState, GoalStatus, Suspension};
 use crate::model::FunctionSpec;
 use crate::projection::ThreadProjection;
 use serde::Deserialize;
@@ -30,9 +30,8 @@ pub enum FunctionExecution {
         output: Value,
         thread_update: Option<ThreadUpdate>,
     },
-    WaitingForUser {
-        request_id: String,
-        prompt: String,
+    Suspended {
+        suspension: Suspension,
         output: Value,
         thread_update: Option<ThreadUpdate>,
     },
@@ -243,9 +242,12 @@ impl AgentFunction for AskUser {
                 }
             })?;
             let request_id = new_id("req");
-            Ok(FunctionExecution::WaitingForUser {
-                request_id: request_id.clone(),
-                prompt: parsed.prompt.clone(),
+            Ok(FunctionExecution::Suspended {
+                suspension: Suspension {
+                    id: request_id.clone(),
+                    kind: crate::events::SuspensionKind::UserInput,
+                    payload: json!({ "prompt": parsed.prompt.clone() }),
+                },
                 output: json!({
                     "request_id": request_id,
                     "prompt": parsed.prompt,
@@ -310,9 +312,10 @@ mod tests {
             .await
             .expect("call");
 
-        let FunctionExecution::WaitingForUser { prompt, .. } = execution else {
+        let FunctionExecution::Suspended { suspension, .. } = execution else {
             panic!("expected waiting");
         };
-        assert_eq!(prompt, "Which thread?");
+        assert_eq!(suspension.kind, crate::events::SuspensionKind::UserInput);
+        assert_eq!(suspension.payload["prompt"], "Which thread?");
     }
 }

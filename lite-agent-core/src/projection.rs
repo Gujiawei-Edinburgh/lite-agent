@@ -1,12 +1,11 @@
-use crate::events::{GoalState, Thread, ToolResult, TurnId, TurnItemKind, TurnStatus};
+use crate::events::{GoalState, Suspension, Thread, ToolResult, TurnId, TurnItemKind, TurnStatus};
 use crate::model::ModelFunctionCall;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct UserInputRequest {
-    pub request_id: String,
-    pub prompt: String,
+pub struct PendingSuspension {
+    pub suspension: Suspension,
     pub turn_id: TurnId,
 }
 
@@ -41,7 +40,7 @@ pub enum ChatMessage {
 pub struct ThreadProjection {
     pub messages_for_model: Vec<ChatMessage>,
     pub goal: Option<GoalState>,
-    pub pending_user_input_request: Option<UserInputRequest>,
+    pub pending_suspension: Option<PendingSuspension>,
     pub completed_function_results: Vec<CompletedFunctionCall>,
     pub last_assistant_message: Option<String>,
     pub latest_turn_id: Option<TurnId>,
@@ -73,14 +72,14 @@ impl ThreadProjection {
                         });
                         if let Some(response_to) = response_to {
                             if projection
-                                .pending_user_input_request
+                                .pending_suspension
                                 .as_ref()
-                                .is_some_and(|request| request.request_id == *response_to)
+                                .is_some_and(|suspension| suspension.suspension.id == *response_to)
                             {
-                                projection.pending_user_input_request = None;
+                                projection.pending_suspension = None;
                             }
                         } else {
-                            projection.pending_user_input_request = None;
+                            projection.pending_suspension = None;
                         }
                     }
                     TurnItemKind::ModelMessage { text } => {
@@ -131,11 +130,21 @@ impl ThreadProjection {
                             });
                         }
                     },
+                    TurnItemKind::SuspensionCreated { suspension } => {
+                        flush_tool_calls(&mut projection, &mut pending_tool_calls);
+                        projection.pending_suspension = Some(PendingSuspension {
+                            suspension: suspension.clone(),
+                            turn_id: turn.id.clone(),
+                        });
+                    }
                     TurnItemKind::UserInputRequested { request_id, prompt } => {
                         flush_tool_calls(&mut projection, &mut pending_tool_calls);
-                        projection.pending_user_input_request = Some(UserInputRequest {
-                            request_id: request_id.clone(),
-                            prompt: prompt.clone(),
+                        projection.pending_suspension = Some(PendingSuspension {
+                            suspension: Suspension {
+                                id: request_id.clone(),
+                                kind: crate::events::SuspensionKind::UserInput,
+                                payload: serde_json::json!({ "prompt": prompt }),
+                            },
                             turn_id: turn.id.clone(),
                         });
                     }
@@ -200,14 +209,17 @@ mod tests {
         let mut first_turn = Turn::new();
         first_turn.push_item(TurnItem::new(
             TurnItemSource::Runtime,
-            TurnItemKind::UserInputRequested {
-                request_id: "r1".to_string(),
-                prompt: "Which one?".to_string(),
+            TurnItemKind::SuspensionCreated {
+                suspension: crate::events::Suspension {
+                    id: "r1".to_string(),
+                    kind: crate::events::SuspensionKind::UserInput,
+                    payload: json!({ "prompt": "Which one?" }),
+                },
             },
         ));
         thread.turns.push(first_turn);
         assert!(ThreadProjection::from_thread(&thread)
-            .pending_user_input_request
+            .pending_suspension
             .is_some());
 
         let mut second_turn = Turn::new();
@@ -220,7 +232,7 @@ mod tests {
         ));
         thread.turns.push(second_turn);
         assert!(ThreadProjection::from_thread(&thread)
-            .pending_user_input_request
+            .pending_suspension
             .is_none());
     }
 
@@ -289,12 +301,15 @@ mod tests {
     fn answered_waiting_turn_is_not_active() {
         let mut thread = Thread::new("t");
         let mut waiting_turn = Turn::new();
-        waiting_turn.set_status(TurnStatus::WaitingForUser);
+        waiting_turn.set_status(TurnStatus::Suspended);
         waiting_turn.push_item(TurnItem::new(
             TurnItemSource::Runtime,
-            TurnItemKind::UserInputRequested {
-                request_id: "r1".to_string(),
-                prompt: "Which one?".to_string(),
+            TurnItemKind::SuspensionCreated {
+                suspension: crate::events::Suspension {
+                    id: "r1".to_string(),
+                    kind: crate::events::SuspensionKind::UserInput,
+                    payload: json!({ "prompt": "Which one?" }),
+                },
             },
         ));
         thread.turns.push(waiting_turn);

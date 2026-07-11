@@ -295,8 +295,8 @@ async fn run_repl(
                     println!();
                 }
             }
-            TurnOutcome::WaitingForUser { prompt, .. } => {
-                println!("{prompt}");
+            TurnOutcome::Suspended { suspension } => {
+                println!("suspended ({:?}): {}", suspension.kind, suspension.payload);
             }
             TurnOutcome::Failed { error } => {
                 println!("turn failed: {error}");
@@ -365,8 +365,11 @@ fn print_stream_event(event: TurnStreamEvent, state: &mut StreamRenderState) {
                 &format!("[function failed] {name} ({call_id}): {error}"),
             );
         }
-        TurnStreamEvent::State(TurnStateEvent::WaitingForUser { prompt, .. }) => {
-            print_process_line(state, &format!("[waiting for user] {prompt}"));
+        TurnStreamEvent::State(TurnStateEvent::Suspended { suspension }) => {
+            print_process_line(
+                state,
+                &format!("[suspended {:?}] {}", suspension.kind, suspension.payload),
+            );
         }
         TurnStreamEvent::State(TurnStateEvent::TurnFailed { error }) => {
             print_process_line(state, &format!("[turn failed] {error}"));
