@@ -575,6 +575,28 @@ impl Agent {
                                             suspension: suspension.clone(),
                                         },
                                     ));
+                                    let skipped_calls = calls
+                                        .iter()
+                                        .skip(call_index + 1)
+                                        .map(|skipped_call| {
+                                            let error = "function not executed because a previous function suspended the turn";
+                                            func_items.push(TurnItem::new(
+                                                TurnItemSource::Tool,
+                                                TurnItemKind::ToolOutput {
+                                                    call_id: skipped_call.call_id.clone(),
+                                                    name: skipped_call.name.clone(),
+                                                    result: ToolResult::Error {
+                                                        error: error.to_string(),
+                                                    },
+                                                },
+                                            ));
+                                            (
+                                                skipped_call.call_id.clone(),
+                                                skipped_call.name.clone(),
+                                                error.to_string(),
+                                            )
+                                        })
+                                        .collect::<Vec<_>>();
                                     Self::push_turn_items(&mut thread, &turn_id, func_items)?;
                                     Self::set_turn_status(
                                         &mut thread,
@@ -592,41 +614,23 @@ impl Agent {
                                     )
                                     .await;
                                     on_event(TurnStreamEvent::State(
-                                        TurnStateEvent::FunctionCompleted { call_id, name },
+                                        TurnStateEvent::FunctionCompleted {
+                                            call_id: call_id.clone(),
+                                            name: name.clone(),
+                                        },
                                     ));
                                     on_event(TurnStreamEvent::State(TurnStateEvent::Suspended {
                                         suspension: suspension.clone(),
                                     }));
-                                    // A suspended call ends this model iteration. Record explicit
-                                    // tool errors for later calls so the next request has no
-                                    // unmatched assistant tool-call records.
-                                    let skipped_items = calls
-                                        .iter()
-                                        .skip(call_index + 1)
-                                        .map(|skipped_call| {
-                                            let skipped_error =
-                                                "function not executed because a previous function suspended the turn";
-                                            on_event(TurnStreamEvent::State(
-                                                TurnStateEvent::FunctionFailed {
-                                                    call_id: skipped_call.call_id.clone(),
-                                                    name: skipped_call.name.clone(),
-                                                    error: skipped_error.to_string(),
-                                                },
-                                            ));
-                                            TurnItem::new(
-                                                TurnItemSource::Tool,
-                                                TurnItemKind::ToolOutput {
-                                                    call_id: skipped_call.call_id.clone(),
-                                                    name: skipped_call.name.clone(),
-                                                    result: ToolResult::Error {
-                                                        error: skipped_error.to_string(),
-                                                    },
-                                                },
-                                            )
-                                        })
-                                        .collect::<Vec<_>>();
-                                    Self::push_turn_items(&mut thread, &turn_id, skipped_items)?;
-                                    thread = self.commit_thread(thread).await?;
+                                    for (skipped_call_id, skipped_name, error) in skipped_calls {
+                                        on_event(TurnStreamEvent::State(
+                                            TurnStateEvent::FunctionFailed {
+                                                call_id: skipped_call_id,
+                                                name: skipped_name,
+                                                error,
+                                            },
+                                        ));
+                                    }
                                     break 'turn_loop TurnOutcome::Suspended { suspension };
                                 }
                                 Err(error) => {
@@ -1428,11 +1432,18 @@ mod tests {
         let agent = agent_with(
             store.clone(),
             vec![ModelResponse::FunctionCalls {
-                calls: vec![ModelFunctionCall {
-                    call_id: "c1".to_string(),
-                    name: "ask_user".to_string(),
-                    arguments: json!({ "prompt": "Which one?" }),
-                }],
+                calls: vec![
+                    ModelFunctionCall {
+                        call_id: "c1".to_string(),
+                        name: "ask_user".to_string(),
+                        arguments: json!({ "prompt": "Which one?" }),
+                    },
+                    ModelFunctionCall {
+                        call_id: "c2".to_string(),
+                        name: "get_goal".to_string(),
+                        arguments: json!({}),
+                    },
+                ],
             }],
         );
 
@@ -1444,6 +1455,14 @@ mod tests {
             .items
             .iter()
             .any(|item| matches!(item.kind, TurnItemKind::SuspensionCreated { .. })));
+        assert_eq!(
+            thread.turns[0]
+                .items
+                .iter()
+                .filter(|item| matches!(item.kind, TurnItemKind::ToolOutput { .. }))
+                .count(),
+            2
+        );
     }
 
     #[tokio::test]
