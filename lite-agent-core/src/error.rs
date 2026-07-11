@@ -10,6 +10,9 @@ pub enum AgentError {
     #[error("invalid thread id: {0}")]
     InvalidThreadId(String),
 
+    #[error("thread store directory is already owned: {0}")]
+    StoreLocked(String),
+
     #[error("turn not found: {0}")]
     TurnNotFound(String),
 

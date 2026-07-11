@@ -1,8 +1,11 @@
 use crate::error::{AgentError, Result};
 use crate::events::{Thread, Turn, TurnItem, TurnStatus};
+use fs2::FileExt;
+use std::fs::{File, OpenOptions};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::Arc;
 use tokio::fs;
 
 pub trait ThreadStore: Send + Sync {
@@ -43,13 +46,45 @@ pub trait ThreadStore: Send + Sync {
 #[derive(Debug, Clone)]
 pub struct JsonFileThreadStore {
     state_dir: PathBuf,
+    _lock: Arc<StoreLock>,
+}
+
+#[derive(Debug)]
+struct StoreLock {
+    file: File,
+}
+
+impl Drop for StoreLock {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
 }
 
 impl JsonFileThreadStore {
-    pub fn new(state_dir: impl Into<PathBuf>) -> Self {
-        Self {
-            state_dir: state_dir.into(),
+    /// Opens and exclusively owns a state directory until the returned store is dropped.
+    ///
+    /// Share the returned store with multiple agents using `Arc`. A second process, or a
+    /// second independently opened store, cannot use the same directory concurrently.
+    pub fn open(state_dir: impl Into<PathBuf>) -> Result<Self> {
+        let state_dir = state_dir.into();
+        std::fs::create_dir_all(&state_dir)?;
+        let lock_path = state_dir.join(".store.lock");
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)?;
+        if let Err(error) = file.try_lock_exclusive() {
+            if error.kind() == std::io::ErrorKind::WouldBlock {
+                return Err(AgentError::StoreLocked(state_dir.display().to_string()));
+            }
+            return Err(error.into());
         }
+        Ok(Self {
+            state_dir,
+            _lock: Arc::new(StoreLock { file }),
+        })
     }
 
     fn thread_path(&self, thread_id: &str) -> PathBuf {
@@ -187,7 +222,7 @@ mod tests {
     #[tokio::test]
     async fn round_trips_thread_with_turn_items() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let store = JsonFileThreadStore::new(temp.path());
+        let store = JsonFileThreadStore::open(temp.path()).expect("store");
         let mut turn = Turn::new();
         let turn_id = turn.id.clone();
         turn.push_item(TurnItem::new(
@@ -215,7 +250,7 @@ mod tests {
     #[tokio::test]
     async fn appends_items_and_updates_status() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let store = JsonFileThreadStore::new(temp.path());
+        let store = JsonFileThreadStore::open(temp.path()).expect("store");
         let turn = Turn::new();
         let turn_id = turn.id.clone();
         store.append_turn("t1", turn).await.expect("append turn");
@@ -246,11 +281,21 @@ mod tests {
     #[tokio::test]
     async fn rejects_path_traversal_thread_ids() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let store = JsonFileThreadStore::new(temp.path());
+        let store = JsonFileThreadStore::open(temp.path()).expect("store");
         let error = store.load("../outside").await.expect_err("invalid id");
         assert!(matches!(
             error,
             crate::AgentError::InvalidThreadId(value) if value == "../outside"
         ));
+    }
+
+    #[test]
+    fn only_one_store_can_own_a_directory() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let first = JsonFileThreadStore::open(temp.path()).expect("first store");
+        let error = JsonFileThreadStore::open(temp.path()).expect_err("second store");
+        assert!(matches!(error, crate::AgentError::StoreLocked(_)));
+        drop(first);
+        JsonFileThreadStore::open(temp.path()).expect("lock released after drop");
     }
 }

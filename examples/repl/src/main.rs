@@ -44,7 +44,7 @@ async fn main() -> lite_agent_core::Result<()> {
         .thread
         .unwrap_or_else(|| lite_agent_core::events::new_id("thread"));
     let _logging_guard = init_file_logging(&args.state_dir)?;
-    let store = Arc::new(JsonFileThreadStore::new(&args.state_dir));
+    let store = Arc::new(JsonFileThreadStore::open(&args.state_dir)?);
     let model_client = Arc::new(ChatCompletionsClient::new(ModelConfig {
         base_url: args.base_url,
         api_key: args.api_key,

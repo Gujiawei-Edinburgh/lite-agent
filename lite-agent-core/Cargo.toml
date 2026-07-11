@@ -18,6 +18,7 @@ tracing = "0.1"
 tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+fs2 = "0.4"
 
 [dev-dependencies]
 tempfile = "3"
