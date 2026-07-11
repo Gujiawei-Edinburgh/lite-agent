@@ -1,12 +1,16 @@
 use crate::error::{AgentError, Result};
-use crate::events::{Thread, Turn, TurnItem, TurnStatus};
+use crate::events::Thread;
 use fs2::FileExt;
+use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::fs;
+use tokio::sync::Mutex as AsyncMutex;
+
+pub type SessionLock = Arc<AsyncMutex<()>>;
 
 pub trait ThreadStore: Send + Sync {
     /// Load one durable thread snapshot.
@@ -15,30 +19,13 @@ pub trait ThreadStore: Send + Sync {
         thread_id: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<Thread>> + Send + 'a>>;
 
-    fn save<'a>(
+    fn commit<'a>(
         &'a self,
         thread: Thread,
+        expected_version: u64,
     ) -> Pin<Box<dyn Future<Output = Result<Thread>> + Send + 'a>>;
 
-    fn append_turn<'a>(
-        &'a self,
-        thread_id: &'a str,
-        turn: Turn,
-    ) -> Pin<Box<dyn Future<Output = Result<Thread>> + Send + 'a>>;
-
-    fn append_turn_items<'a>(
-        &'a self,
-        thread_id: &'a str,
-        turn_id: &'a str,
-        items: Vec<TurnItem>,
-    ) -> Pin<Box<dyn Future<Output = Result<Thread>> + Send + 'a>>;
-
-    fn update_turn_status<'a>(
-        &'a self,
-        thread_id: &'a str,
-        turn_id: &'a str,
-        status: TurnStatus,
-    ) -> Pin<Box<dyn Future<Output = Result<Thread>> + Send + 'a>>;
+    fn session_lock(&self, thread_id: &str) -> SessionLock;
 }
 
 /// Single-process JSON persistence intended for local development and examples.
@@ -47,6 +34,8 @@ pub trait ThreadStore: Send + Sync {
 pub struct JsonFileThreadStore {
     state_dir: PathBuf,
     _lock: Arc<StoreLock>,
+    session_locks: Arc<std::sync::Mutex<BTreeMap<String, SessionLock>>>,
+    commit_lock: Arc<AsyncMutex<()>>,
 }
 
 #[derive(Debug)]
@@ -84,6 +73,8 @@ impl JsonFileThreadStore {
         Ok(Self {
             state_dir,
             _lock: Arc::new(StoreLock { file }),
+            session_locks: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
+            commit_lock: Arc::new(AsyncMutex::new(())),
         })
     }
 
@@ -121,6 +112,27 @@ impl JsonFileThreadStore {
         fs::rename(temporary_path, path).await?;
         Ok(())
     }
+
+    async fn commit_thread(&self, mut thread: Thread, expected_version: u64) -> Result<Thread> {
+        let _commit_guard = self.commit_lock.lock().await;
+        Self::validate_thread_id(&thread.id)?;
+        let current = match self.load(&thread.id).await {
+            Ok(current) => current,
+            Err(AgentError::ThreadNotFound(_)) => Thread::new(thread.id.clone()),
+            Err(error) => return Err(error),
+        };
+        if current.version != expected_version {
+            return Err(AgentError::VersionConflict {
+                thread_id: thread.id.clone(),
+                expected: expected_version,
+                actual: current.version,
+            });
+        }
+        thread.version = expected_version.saturating_add(1);
+        thread.touch();
+        self.write_thread(&thread).await?;
+        Ok(thread)
+    }
 }
 
 impl ThreadStore for JsonFileThreadStore {
@@ -141,75 +153,20 @@ impl ThreadStore for JsonFileThreadStore {
         })
     }
 
-    fn save<'a>(
+    fn commit<'a>(
         &'a self,
-        mut thread: Thread,
+        thread: Thread,
+        expected_version: u64,
     ) -> Pin<Box<dyn Future<Output = Result<Thread>> + Send + 'a>> {
-        Box::pin(async move {
-            Self::validate_thread_id(&thread.id)?;
-            thread.touch();
-            self.write_thread(&thread).await?;
-            Ok(thread)
-        })
+        Box::pin(async move { self.commit_thread(thread, expected_version).await })
     }
 
-    fn append_turn<'a>(
-        &'a self,
-        thread_id: &'a str,
-        turn: Turn,
-    ) -> Pin<Box<dyn Future<Output = Result<Thread>> + Send + 'a>> {
-        Box::pin(async move {
-            Self::validate_thread_id(thread_id)?;
-            let mut thread = match self.load(thread_id).await {
-                Ok(thread) => thread,
-                Err(AgentError::ThreadNotFound(_)) => Thread::new(thread_id),
-                Err(error) => return Err(error),
-            };
-            thread.turns.push(turn);
-            thread.touch();
-            self.write_thread(&thread).await?;
-            Ok(thread)
-        })
-    }
-
-    fn append_turn_items<'a>(
-        &'a self,
-        thread_id: &'a str,
-        turn_id: &'a str,
-        items: Vec<TurnItem>,
-    ) -> Pin<Box<dyn Future<Output = Result<Thread>> + Send + 'a>> {
-        Box::pin(async move {
-            Self::validate_thread_id(thread_id)?;
-            let mut thread = self.load(thread_id).await?;
-            let turn = thread
-                .turn_mut(turn_id)
-                .ok_or_else(|| AgentError::TurnNotFound(turn_id.to_string()))?;
-            for item in items {
-                turn.push_item(item);
-            }
-            thread.touch();
-            self.write_thread(&thread).await?;
-            Ok(thread)
-        })
-    }
-
-    fn update_turn_status<'a>(
-        &'a self,
-        thread_id: &'a str,
-        turn_id: &'a str,
-        status: TurnStatus,
-    ) -> Pin<Box<dyn Future<Output = Result<Thread>> + Send + 'a>> {
-        Box::pin(async move {
-            Self::validate_thread_id(thread_id)?;
-            let mut thread = self.load(thread_id).await?;
-            let turn = thread
-                .turn_mut(turn_id)
-                .ok_or_else(|| AgentError::TurnNotFound(turn_id.to_string()))?;
-            turn.set_status(status);
-            thread.touch();
-            self.write_thread(&thread).await?;
-            Ok(thread)
-        })
+    fn session_lock(&self, thread_id: &str) -> SessionLock {
+        let mut locks = self.session_locks.lock().expect("session lock registry");
+        locks
+            .entry(thread_id.to_string())
+            .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+            .clone()
     }
 }
 
@@ -233,12 +190,15 @@ mod tests {
         ));
 
         store
-            .save(Thread {
-                turns: vec![turn],
-                ..Thread::new("t1")
-            })
+            .commit(
+                Thread {
+                    turns: vec![turn],
+                    ..Thread::new("t1")
+                },
+                0,
+            )
             .await
-            .expect("save");
+            .expect("commit");
 
         let thread = store.load("t1").await.expect("load");
         assert_eq!(thread.id, "t1");
@@ -248,31 +208,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn appends_items_and_updates_status() {
+    async fn commits_thread_snapshot() {
         let temp = tempfile::tempdir().expect("tempdir");
         let store = JsonFileThreadStore::open(temp.path()).expect("store");
-        let turn = Turn::new();
-        let turn_id = turn.id.clone();
-        store.append_turn("t1", turn).await.expect("append turn");
-
-        store
-            .append_turn_items(
-                "t1",
-                &turn_id,
-                vec![TurnItem::new(
-                    TurnItemSource::User,
-                    TurnItemKind::UserInput {
-                        text: "hi".to_string(),
-                        response_to: None,
-                    },
-                )],
+        let mut turn = Turn::new();
+        turn.push_item(TurnItem::new(
+            TurnItemSource::User,
+            TurnItemKind::UserInput {
+                text: "hi".to_string(),
+                response_to: None,
+            },
+        ));
+        turn.set_status(TurnStatus::Completed);
+        let thread = store
+            .commit(
+                Thread {
+                    turns: vec![turn],
+                    ..Thread::new("t1")
+                },
+                0,
             )
             .await
-            .expect("append items");
-        let thread = store
-            .update_turn_status("t1", &turn_id, TurnStatus::Completed)
-            .await
-            .expect("status");
+            .expect("commit");
 
         assert_eq!(thread.turns[0].status, TurnStatus::Completed);
         assert_eq!(thread.turns[0].items.len(), 1);
@@ -297,5 +254,33 @@ mod tests {
         assert!(matches!(error, crate::AgentError::StoreLocked(_)));
         drop(first);
         JsonFileThreadStore::open(temp.path()).expect("lock released after drop");
+    }
+
+    #[tokio::test]
+    async fn rejects_stale_thread_version() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = JsonFileThreadStore::open(temp.path()).expect("store");
+        let created = store.commit(Thread::new("t1"), 0).await.expect("create");
+        assert_eq!(created.version, 1);
+
+        let stale = store.load("t1").await.expect("load");
+        let mut current = stale.clone();
+        current.goal = Some(crate::events::GoalState {
+            objective: "first".to_string(),
+            status: crate::events::GoalStatus::Active,
+            notes: None,
+        });
+        let committed = store.commit(current, stale.version).await.expect("commit");
+        assert_eq!(committed.version, 2);
+
+        let error = store.commit(stale, 1).await.expect_err("stale commit");
+        assert!(matches!(
+            error,
+            crate::AgentError::VersionConflict {
+                expected: 1,
+                actual: 2,
+                ..
+            }
+        ));
     }
 }

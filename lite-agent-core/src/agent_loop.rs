@@ -9,11 +9,10 @@ use crate::projection::{ChatMessage, ThreadProjection};
 use crate::store::ThreadStore;
 use chrono::{Local, Utc};
 use serde_json::Value;
-use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use tokio::sync::{watch, Mutex as AsyncMutex, OwnedMutexGuard};
+use tokio::sync::watch;
 
 pub trait RuntimeContextProvider: Send + Sync {
     fn context_for_turn(&self, input: RuntimeContextInput<'_>) -> Option<String>;
@@ -234,7 +233,6 @@ pub struct Agent {
     model_client: Arc<dyn ModelClient>,
     function_registry: FunctionRegistry,
     function_call_hooks: Vec<Arc<dyn FunctionCallHook>>,
-    session_locks: Arc<AsyncMutex<BTreeMap<String, Arc<AsyncMutex<()>>>>>,
 }
 
 impl Agent {
@@ -250,7 +248,6 @@ impl Agent {
             model_client,
             function_registry,
             function_call_hooks: Vec::new(),
-            session_locks: Arc::new(AsyncMutex::new(BTreeMap::new())),
         }
     }
 
@@ -300,7 +297,8 @@ impl Agent {
     where
         F: FnMut(TurnStreamEvent) + Send + 'a,
     {
-        let _session_lock = self.acquire_session_lock(thread_id).await;
+        let session_lock = self.store.session_lock(thread_id);
+        let _session_lock = session_lock.lock().await;
         tracing::debug!(thread_id, "session lock acquired");
 
         let user_text = user_text.into();
@@ -334,7 +332,7 @@ impl Agent {
             },
         ));
         thread.turns.push(turn);
-        thread = self.store.save(thread).await?;
+        thread = self.commit_thread(thread).await?;
         tracing::info!(thread_id, turn_id, "turn started");
         on_event(TurnStreamEvent::State(TurnStateEvent::TurnStarted {
             thread_id: thread_id.to_string(),
@@ -418,7 +416,7 @@ impl Agent {
                                     TurnItemKind::ModelMessage { text: text.clone() },
                                 )],
                             )?;
-                            thread = self.store.save(thread).await?;
+                            thread = self.commit_thread(thread).await?;
                         }
                         if function_calls.is_empty() {
                             let text = text.unwrap_or_default();
@@ -456,7 +454,7 @@ impl Agent {
                             })
                             .collect();
                         Self::push_turn_items(&mut thread, &session.active_turn_id, call_items)?;
-                        thread = self.store.save(thread).await?;
+                        thread = self.commit_thread(thread).await?;
 
                         for (call_index, call) in calls.iter().enumerate() {
                             let call_id = call.call_id.clone();
@@ -531,7 +529,7 @@ impl Agent {
                                         },
                                     ));
                                     Self::push_turn_items(&mut thread, &turn_id, func_items)?;
-                                    thread = self.store.save(thread).await?;
+                                    thread = self.commit_thread(thread).await?;
                                     let mut after_context = hook_context.clone();
                                     after_context.projection_after =
                                         Some(ThreadProjection::from_thread(&thread));
@@ -578,7 +576,7 @@ impl Agent {
                                         &turn_id,
                                         TurnStatus::Suspended,
                                     )?;
-                                    thread = self.store.save(thread).await?;
+                                    thread = self.commit_thread(thread).await?;
                                     let mut after_context = hook_context.clone();
                                     after_context.projection_after =
                                         Some(ThreadProjection::from_thread(&thread));
@@ -623,7 +621,7 @@ impl Agent {
                                         })
                                         .collect::<Vec<_>>();
                                     Self::push_turn_items(&mut thread, &turn_id, skipped_items)?;
-                                    thread = self.store.save(thread).await?;
+                                    thread = self.commit_thread(thread).await?;
                                     break 'turn_loop TurnOutcome::Suspended { suspension };
                                 }
                                 Err(error) => {
@@ -645,7 +643,7 @@ impl Agent {
                                             },
                                         )],
                                     )?;
-                                    thread = self.store.save(thread).await?;
+                                    thread = self.commit_thread(thread).await?;
                                     let mut after_context = hook_context.clone();
                                     after_context.projection_after =
                                         Some(ThreadProjection::from_thread(&thread));
@@ -680,7 +678,7 @@ impl Agent {
         };
 
         Self::apply_turn_token_usage(&mut thread, turn_token_usage);
-        self.store.save(thread).await?;
+        self.commit_thread(thread).await?;
         if let TurnOutcome::Failed { error } = &outcome {
             on_event(TurnStreamEvent::State(TurnStateEvent::TurnFailed {
                 error: error.clone(),
@@ -771,15 +769,9 @@ impl Agent {
         }
     }
 
-    async fn acquire_session_lock(&self, thread_id: &str) -> OwnedMutexGuard<()> {
-        let lock = {
-            let mut locks = self.session_locks.lock().await;
-            locks
-                .entry(thread_id.to_string())
-                .or_insert_with(|| Arc::new(AsyncMutex::new(())))
-                .clone()
-        };
-        lock.lock_owned().await
+    async fn commit_thread(&self, thread: Thread) -> Result<Thread> {
+        let expected_version = thread.version;
+        self.store.commit(thread, expected_version).await
     }
 
     fn model_request_from_projection(

@@ -14,6 +14,8 @@ static ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 pub struct Thread {
     #[serde(default = "current_schema_version")]
     pub schema_version: u32,
+    #[serde(default)]
+    pub version: u64,
     pub id: ThreadId,
     pub goal: Option<GoalState>,
     pub turns: Vec<Turn>,
@@ -28,6 +30,7 @@ impl Thread {
         let now = now_timestamp();
         Self {
             schema_version: current_schema_version(),
+            version: 0,
             id: id.into(),
             goal: None,
             turns: Vec::new(),

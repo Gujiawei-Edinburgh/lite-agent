@@ -13,6 +13,13 @@ pub enum AgentError {
     #[error("thread store directory is already owned: {0}")]
     StoreLocked(String),
 
+    #[error("thread version conflict for {thread_id}: expected {expected}, actual {actual}")]
+    VersionConflict {
+        thread_id: String,
+        expected: u64,
+        actual: u64,
+    },
+
     #[error("turn not found: {0}")]
     TurnNotFound(String),
 
