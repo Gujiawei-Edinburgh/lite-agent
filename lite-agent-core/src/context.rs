@@ -127,7 +127,7 @@ impl ContextBuilder for CompactingContextBuilder {
             let groups = tool_call_blocks(&input.projection.conversation);
             let mut selected = Vec::new();
             let mut selected_tokens: usize = 0;
-            let mut first_omitted_group = groups.len();
+            let mut first_omitted_group = None;
 
             for (index, group) in groups.iter().enumerate().rev() {
                 let group_tokens = self.estimator.estimate(group);
@@ -138,25 +138,24 @@ impl ContextBuilder for CompactingContextBuilder {
                     });
                 }
                 if selected_tokens.saturating_add(group_tokens) > budget {
-                    first_omitted_group = index;
+                    first_omitted_group = Some(index);
                     break;
                 }
                 selected.splice(0..0, group.iter().cloned());
                 selected_tokens = selected_tokens.saturating_add(group_tokens);
-                first_omitted_group = index;
             }
 
-            let omitted: Vec<ChatMessage> = groups[..first_omitted_group]
-                .iter()
-                .flatten()
-                .cloned()
-                .collect();
+            let omitted: Vec<ChatMessage> = first_omitted_group
+                .map(|index| groups[..index].iter().flatten().cloned().collect())
+                .unwrap_or_default();
             let cache_is_current = input.cached_context.is_some_and(|cache| {
                 cache.source_version == input.thread_version
                     && cache.policy_version == self.policy_version
                     && cache.covered_message_count == omitted.len()
             });
-            let summary = if cache_is_current {
+            let summary = if omitted.is_empty() {
+                None
+            } else if cache_is_current {
                 input.cached_context.map(|cache| cache.summary.clone())
             } else if let Some(compactor) = &self.compactor {
                 let previous_summary = input.cached_context.and_then(|cache| {
@@ -230,8 +229,30 @@ fn tool_call_blocks(messages: &[ChatMessage]) -> Vec<Vec<ChatMessage>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ChatMessage, CompactingContextBuilder, ContextBuildInput, ContextBuilder};
+    use super::{
+        ChatMessage, CompactingContextBuilder, CompactionInput, ContextBuildInput, ContextBuilder,
+        ContextCompactor,
+    };
     use crate::projection::ThreadProjection;
+    use crate::Result;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    struct CountingCompactor(Arc<AtomicUsize>);
+
+    impl ContextCompactor for CountingCompactor {
+        fn compact<'a>(
+            &'a self,
+            _input: CompactionInput,
+        ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok("summary".to_string()) })
+        }
+    }
 
     #[tokio::test]
     async fn keeps_recent_messages_within_budget() {
@@ -265,5 +286,33 @@ mod tests {
             message,
             ChatMessage::User { content } if content == "new"
         )));
+    }
+
+    #[tokio::test]
+    async fn does_not_compact_when_all_messages_fit() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let builder =
+            CompactingContextBuilder::default().with_compactor(CountingCompactor(calls.clone()));
+        let projection = ThreadProjection {
+            conversation: vec![ChatMessage::User {
+                content: "short".to_string(),
+            }],
+            ..ThreadProjection::default()
+        };
+
+        let output = builder
+            .build(ContextBuildInput {
+                projection: &projection,
+                thread_id: "t",
+                thread_version: 1,
+                system_prompt: "system",
+                runtime_context: None,
+                cached_context: None,
+            })
+            .await
+            .expect("context");
+
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(output.cache.is_none());
     }
 }
