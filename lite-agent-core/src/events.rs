@@ -186,11 +186,6 @@ pub enum TurnItemKind {
     SuspensionCreated {
         suspension: Suspension,
     },
-    /// Legacy record retained for backwards-compatible thread loading.
-    UserInputRequested {
-        request_id: String,
-        prompt: String,
-    },
     GoalUpdated {
         previous: Option<GoalState>,
         current: GoalState,

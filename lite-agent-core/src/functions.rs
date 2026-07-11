@@ -251,7 +251,7 @@ impl AgentFunction for AskUser {
                 output: json!({
                     "request_id": request_id,
                     "prompt": parsed.prompt,
-                    "status": "waiting_for_user"
+                    "status": "suspended"
                 }),
                 thread_update: None,
             })
@@ -295,7 +295,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ask_user_returns_waiting_state() {
+    async fn ask_user_returns_suspended_state() {
         let registry = builtin_registry();
         let execution = registry
             .call(

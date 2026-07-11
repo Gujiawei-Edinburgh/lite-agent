@@ -137,17 +137,6 @@ impl ThreadProjection {
                             turn_id: turn.id.clone(),
                         });
                     }
-                    TurnItemKind::UserInputRequested { request_id, prompt } => {
-                        flush_tool_calls(&mut projection, &mut pending_tool_calls);
-                        projection.pending_suspension = Some(PendingSuspension {
-                            suspension: Suspension {
-                                id: request_id.clone(),
-                                kind: crate::events::SuspensionKind::UserInput,
-                                payload: serde_json::json!({ "prompt": prompt }),
-                            },
-                            turn_id: turn.id.clone(),
-                        });
-                    }
                     TurnItemKind::GoalUpdated { current, .. } => {
                         flush_tool_calls(&mut projection, &mut pending_tool_calls);
                         projection.goal = Some(current.clone());
@@ -204,7 +193,7 @@ mod tests {
     }
 
     #[test]
-    fn tracks_pending_user_input_request() {
+    fn tracks_pending_suspension() {
         let mut thread = Thread::new("t");
         let mut first_turn = Turn::new();
         first_turn.push_item(TurnItem::new(
@@ -298,7 +287,7 @@ mod tests {
     }
 
     #[test]
-    fn answered_waiting_turn_is_not_active() {
+    fn answered_suspended_turn_is_not_active() {
         let mut thread = Thread::new("t");
         let mut waiting_turn = Turn::new();
         waiting_turn.set_status(TurnStatus::Suspended);
