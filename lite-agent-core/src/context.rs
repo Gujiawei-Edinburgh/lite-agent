@@ -146,7 +146,7 @@ impl ContextBuilder for CompactingContextBuilder {
             }
 
             let omitted: Vec<ChatMessage> = first_omitted_group
-                .map(|index| groups[..index].iter().flatten().cloned().collect())
+                .map(|index| groups[..=index].iter().flatten().cloned().collect())
                 .unwrap_or_default();
             let cache_is_current = input.cached_context.is_some_and(|cache| {
                 cache.source_version == input.thread_version
