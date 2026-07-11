@@ -38,7 +38,7 @@ pub enum ChatMessage {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct ThreadProjection {
-    pub messages_for_model: Vec<ChatMessage>,
+    pub conversation: Vec<ChatMessage>,
     pub goal: Option<GoalState>,
     pub pending_suspension: Option<PendingSuspension>,
     pub completed_function_results: Vec<CompletedFunctionCall>,
@@ -67,7 +67,7 @@ impl ThreadProjection {
                 match &item.kind {
                     TurnItemKind::UserInput { text, response_to } => {
                         flush_tool_calls(&mut projection, &mut pending_tool_calls);
-                        projection.messages_for_model.push(ChatMessage::User {
+                        projection.conversation.push(ChatMessage::User {
                             content: text.clone(),
                         });
                         if let Some(response_to) = response_to {
@@ -85,7 +85,7 @@ impl ThreadProjection {
                     TurnItemKind::ModelMessage { text } => {
                         flush_tool_calls(&mut projection, &mut pending_tool_calls);
                         projection.last_assistant_message = Some(text.clone());
-                        projection.messages_for_model.push(ChatMessage::Assistant {
+                        projection.conversation.push(ChatMessage::Assistant {
                             content: Some(text.clone()),
                             tool_calls: Vec::new(),
                         });
@@ -115,7 +115,7 @@ impl ThreadProjection {
                                     name: name.clone(),
                                     output: output.clone(),
                                 });
-                            projection.messages_for_model.push(ChatMessage::Tool {
+                            projection.conversation.push(ChatMessage::Tool {
                                 tool_call_id: call_id.clone(),
                                 name: name.clone(),
                                 content: output.clone(),
@@ -123,7 +123,7 @@ impl ThreadProjection {
                         }
                         ToolResult::Error { error } => {
                             flush_tool_calls(&mut projection, &mut pending_tool_calls);
-                            projection.messages_for_model.push(ChatMessage::Tool {
+                            projection.conversation.push(ChatMessage::Tool {
                                 tool_call_id: call_id.clone(),
                                 name: name.clone(),
                                 content: Value::String(error.clone()),
@@ -160,7 +160,7 @@ fn flush_tool_calls(
     if pending_tool_calls.is_empty() {
         return;
     }
-    projection.messages_for_model.push(ChatMessage::Assistant {
+    projection.conversation.push(ChatMessage::Assistant {
         content: None,
         tool_calls: std::mem::take(pending_tool_calls),
     });
@@ -251,12 +251,12 @@ mod tests {
 
         let projection = ThreadProjection::from_thread(&thread);
         assert!(matches!(
-            &projection.messages_for_model[0],
+            &projection.conversation[0],
             ChatMessage::Assistant { tool_calls, .. }
                 if tool_calls.len() == 1 && tool_calls[0].call_id == "call_1"
         ));
         assert!(matches!(
-            &projection.messages_for_model[1],
+            &projection.conversation[1],
             ChatMessage::Tool { tool_call_id, content, .. }
                 if tool_call_id == "call_1" && content == &json!({ "stdout": "src\n" })
         ));
@@ -279,9 +279,9 @@ mod tests {
         thread.turns.push(turn);
 
         let projection = ThreadProjection::from_thread(&thread);
-        assert_eq!(projection.messages_for_model.len(), 1);
+        assert_eq!(projection.conversation.len(), 1);
         assert!(matches!(
-            &projection.messages_for_model[0],
+            &projection.conversation[0],
             ChatMessage::Assistant { tool_calls, .. } if tool_calls.len() == 2
         ));
     }

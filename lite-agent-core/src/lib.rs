@@ -1,4 +1,5 @@
 pub mod agent_loop;
+pub mod context;
 pub mod error;
 pub mod events;
 pub mod functions;
@@ -12,6 +13,10 @@ pub use agent_loop::{
     FunctionCallHookResult, RuntimeContextInput, RuntimeContextProvider, RuntimeEvent,
     TurnAbortHandle, TurnAbortSignal, TurnModelEvent, TurnOutcome, TurnStateEvent, TurnStreamEvent,
 };
+pub use context::{
+    ApproximateTokenEstimator, CompactingContextBuilder, ContextBuildInput, ContextBuilder,
+    ContextCompactor, TokenEstimator,
+};
 pub use error::{AgentError, Result};
 pub use events::{
     GoalState, GoalStatus, Suspension, SuspensionKind, Thread, ThreadId, TokenUsage, ToolResult,
@@ -23,5 +28,5 @@ pub use functions::{
 };
 pub use logging::{init_file_logging, LoggingGuard};
 pub use model::{ChatCompletionsClient, FunctionSpec, ModelClient, ModelConfig};
-pub use projection::ThreadProjection;
+pub use projection::{ChatMessage, ThreadProjection};
 pub use store::{JsonFileThreadStore, ThreadStore};

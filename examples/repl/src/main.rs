@@ -3,8 +3,9 @@ use lite_agent_core::model::FunctionSpec;
 use lite_agent_core::FunctionContext;
 use lite_agent_core::{
     builtin_registry, init_file_logging, turn_abort_pair, Agent, AgentConfig,
-    ChatCompletionsClient, FunctionRegistry, JsonFileThreadStore, ModelConfig, ThreadStore,
-    TurnModelEvent, TurnOutcome, TurnStateEvent, TurnStreamEvent,
+    ChatCompletionsClient, ChatMessage, CompactingContextBuilder, ContextCompactor,
+    FunctionRegistry, JsonFileThreadStore, ModelConfig, Result, ThreadStore, TurnModelEvent,
+    TurnOutcome, TurnStateEvent, TurnStreamEvent,
 };
 use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
@@ -56,6 +57,9 @@ async fn main() -> lite_agent_core::Result<()> {
         store.clone(),
         model_client,
         example_registry(args.command_cwd),
+    )
+    .with_context_builder(
+        CompactingContextBuilder::default().with_compactor(ExampleContextCompactor),
     );
 
     run_repl(agent, store, thread_id).await
@@ -65,6 +69,42 @@ fn example_registry(command_cwd: PathBuf) -> FunctionRegistry {
     let mut registry = builtin_registry();
     registry.register(exec_command_function(command_cwd));
     registry
+}
+
+struct ExampleContextCompactor;
+
+impl ContextCompactor for ExampleContextCompactor {
+    fn compact(&self, omitted: &[ChatMessage]) -> Result<Option<ChatMessage>> {
+        if omitted.is_empty() {
+            return Ok(None);
+        }
+        let mut summary = String::from(
+            "Earlier conversation context was compacted. These are approximate excerpts:\n",
+        );
+        for message in omitted {
+            let excerpt = match message {
+                ChatMessage::User { content } => format!("user: {content}"),
+                ChatMessage::Assistant { content, .. } => {
+                    format!("assistant: {}", content.as_deref().unwrap_or("[tool call]"))
+                }
+                ChatMessage::Tool { name, content, .. } => format!("tool {name}: {content}"),
+                ChatMessage::System { content } => format!("system: {content}"),
+            };
+            summary.push_str(&truncate_excerpt(&excerpt));
+            summary.push('\n');
+        }
+        Ok(Some(ChatMessage::System { content: summary }))
+    }
+}
+
+fn truncate_excerpt(value: &str) -> String {
+    const MAX_CHARS: usize = 240;
+    if value.chars().count() <= MAX_CHARS {
+        return value.to_string();
+    }
+    let mut excerpt: String = value.chars().take(MAX_CHARS).collect();
+    excerpt.push_str("...");
+    excerpt
 }
 
 fn exec_command_function(command_cwd: PathBuf) -> impl lite_agent_core::functions::AgentFunction {

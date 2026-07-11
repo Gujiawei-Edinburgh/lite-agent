@@ -1,3 +1,4 @@
+use crate::context::{CompactingContextBuilder, ContextBuildInput, ContextBuilder};
 use crate::error::{AgentError, Result};
 use crate::events::{
     Suspension, Thread, TokenUsage, ToolResult, Turn, TurnId, TurnItem, TurnItemKind,
@@ -5,9 +6,8 @@ use crate::events::{
 };
 use crate::functions::{FunctionContext, FunctionExecution, FunctionRegistry, ThreadUpdate};
 use crate::model::{ModelClient, ModelRequest, ModelResponse, ModelStreamEvent};
-use crate::projection::{ChatMessage, ThreadProjection};
+use crate::projection::ThreadProjection;
 use crate::store::ThreadStore;
-use chrono::{Local, Utc};
 use serde_json::Value;
 use std::future::Future;
 use std::pin::Pin;
@@ -233,6 +233,7 @@ pub struct Agent {
     model_client: Arc<dyn ModelClient>,
     function_registry: FunctionRegistry,
     function_call_hooks: Vec<Arc<dyn FunctionCallHook>>,
+    context_builder: Arc<dyn ContextBuilder>,
 }
 
 impl Agent {
@@ -248,6 +249,7 @@ impl Agent {
             model_client,
             function_registry,
             function_call_hooks: Vec::new(),
+            context_builder: Arc::new(CompactingContextBuilder::default()),
         }
     }
 
@@ -261,6 +263,14 @@ impl Agent {
 
     pub fn with_function_call_hooks(mut self, hooks: Vec<Arc<dyn FunctionCallHook>>) -> Self {
         self.function_call_hooks.extend(hooks);
+        self
+    }
+
+    pub fn with_context_builder<C>(mut self, context_builder: C) -> Self
+    where
+        C: ContextBuilder + 'static,
+    {
+        self.context_builder = Arc::new(context_builder);
         self
     }
 
@@ -346,7 +356,7 @@ impl Agent {
                 let request = self.model_request_from_projection(
                     session.projection.clone(),
                     runtime_context.as_deref(),
-                );
+                )?;
                 on_event(TurnStreamEvent::Model(TurnModelEvent::RequestStarted {
                     iteration,
                 }));
@@ -778,39 +788,15 @@ impl Agent {
         &self,
         projection: ThreadProjection,
         runtime_context: Option<&str>,
-    ) -> ModelRequest {
-        let mut system_content = self.config.system_prompt.clone();
-        if let Some(runtime_context) = runtime_context {
-            let runtime_context = runtime_context.trim();
-            if !runtime_context.is_empty() {
-                system_content.push_str(
-                    "\nCurrent turn runtime context. This host-supplied context applies only to this model request and is not durable thread state:\n",
-                );
-                system_content.push_str(runtime_context);
-            }
-        }
-        system_content.push_str(&format!(
-            "\nCurrent time context: local={}, utc={}. Use this as the current date/time for time-sensitive answers.",
-            Local::now().format("%Y-%m-%d %H:%M:%S %:z"),
-            Utc::now().format("%Y-%m-%d %H:%M:%S UTC")
-        ));
-        if let Some(goal) = &projection.goal {
-            system_content.push_str(&format!(
-                "\nCurrent thread goal: objective={}, status={:?}, notes={}",
-                goal.objective,
-                goal.status,
-                goal.notes.as_deref().unwrap_or("")
-            ));
-        }
-        let mut messages = vec![ChatMessage::System {
-            content: system_content,
-        }];
-        messages.extend(projection.messages_for_model);
-
-        ModelRequest {
-            messages,
+    ) -> Result<ModelRequest> {
+        Ok(ModelRequest {
+            messages: self.context_builder.build(ContextBuildInput {
+                projection: &projection,
+                system_prompt: &self.config.system_prompt,
+                runtime_context,
+            })?,
             functions: self.function_registry.specs(),
-        }
+        })
     }
 
     fn apply_thread_update(thread: &mut Thread, update: Option<ThreadUpdate>) -> Option<TurnItem> {
@@ -1211,7 +1197,9 @@ mod tests {
             }],
         );
 
-        let request = agent.model_request_from_projection(Default::default(), None);
+        let request = agent
+            .model_request_from_projection(Default::default(), None)
+            .expect("context");
         let Some(crate::projection::ChatMessage::System { content }) = request.messages.first()
         else {
             panic!("missing system message");

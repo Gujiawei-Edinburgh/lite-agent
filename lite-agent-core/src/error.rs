@@ -20,6 +20,9 @@ pub enum AgentError {
         actual: u64,
     },
 
+    #[error("context window exceeded: estimated {estimated} tokens, limit {limit}")]
+    ContextWindowExceeded { estimated: usize, limit: usize },
+
     #[error("turn not found: {0}")]
     TurnNotFound(String),
 
