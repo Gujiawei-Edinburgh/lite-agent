@@ -172,8 +172,6 @@ pub struct FunctionCallHookContext {
     pub name: String,
     pub arguments: Value,
     pub projection: ThreadProjection,
-    /// Set for after-hooks after the resulting thread state has been reconstructed.
-    pub projection_after: Option<ThreadProjection>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -475,18 +473,16 @@ impl Agent {
                                 call_id: call_id.clone(),
                                 name: name.clone(),
                             }));
-                            let projection = ThreadProjection::from_thread(&thread);
-                            let hook_context = FunctionCallHookContext {
+                            let mut hook_context = FunctionCallHookContext {
                                 thread_id: thread.id.clone(),
                                 turn_id: turn_id.clone(),
                                 call_id: call_id.clone(),
                                 name: name.clone(),
                                 arguments: call.arguments.clone(),
-                                projection: projection.clone(),
-                                projection_after: None,
+                                projection: ThreadProjection::from_thread(&thread),
                             };
                             let (entered_hooks, pre_hook_result) = self
-                                .run_before_function_call_hooks(hook_context.clone(), &mut on_event)
+                                .run_before_function_call_hooks(&hook_context, &mut on_event)
                                 .await;
                             let execution = match pre_hook_result {
                                 Ok(()) => {
@@ -494,7 +490,7 @@ impl Agent {
                                         thread_id: thread.id.clone(),
                                         turn_id: turn_id.clone(),
                                         call_id: call_id.clone(),
-                                        projection,
+                                        projection: hook_context.projection.clone(),
                                         abort_signal: abort_signal.clone(),
                                     };
                                     let function_call = self.function_registry.call(
@@ -542,12 +538,11 @@ impl Agent {
                                     ));
                                     Self::push_turn_items(&mut thread, &turn_id, func_items)?;
                                     thread = self.commit_thread(thread).await?;
-                                    let mut after_context = hook_context.clone();
-                                    after_context.projection_after =
-                                        Some(ThreadProjection::from_thread(&thread));
+                                    hook_context.projection =
+                                        ThreadProjection::from_thread(&thread);
                                     self.run_after_function_call_hooks(
                                         &entered_hooks,
-                                        after_context,
+                                        &hook_context,
                                         hook_result,
                                         &mut on_event,
                                     )
@@ -612,12 +607,11 @@ impl Agent {
                                         TurnStatus::Suspended,
                                     )?;
                                     thread = self.commit_thread(thread).await?;
-                                    let mut after_context = hook_context.clone();
-                                    after_context.projection_after =
-                                        Some(ThreadProjection::from_thread(&thread));
+                                    hook_context.projection =
+                                        ThreadProjection::from_thread(&thread);
                                     self.run_after_function_call_hooks(
                                         &entered_hooks,
-                                        after_context,
+                                        &hook_context,
                                         hook_result,
                                         &mut on_event,
                                     )
@@ -662,12 +656,11 @@ impl Agent {
                                         )],
                                     )?;
                                     thread = self.commit_thread(thread).await?;
-                                    let mut after_context = hook_context.clone();
-                                    after_context.projection_after =
-                                        Some(ThreadProjection::from_thread(&thread));
+                                    hook_context.projection =
+                                        ThreadProjection::from_thread(&thread);
                                     self.run_after_function_call_hooks(
                                         &entered_hooks,
-                                        after_context,
+                                        &hook_context,
                                         hook_result,
                                         &mut on_event,
                                     )
@@ -754,12 +747,12 @@ impl Agent {
 
     async fn run_before_function_call_hooks(
         &self,
-        context: FunctionCallHookContext,
+        context: &FunctionCallHookContext,
         on_event: &mut TurnEventHandler<'_>,
     ) -> (Vec<Arc<dyn FunctionCallHook>>, Result<()>) {
         let mut entered_hooks = Vec::new();
         for hook in &self.function_call_hooks {
-            if let Err(error) = hook.before_call(context.clone(), on_event).await {
+            if let Err(error) = hook.before_call((*context).clone(), on_event).await {
                 return (entered_hooks, Err(error));
             }
             entered_hooks.push(hook.clone());
@@ -770,13 +763,13 @@ impl Agent {
     async fn run_after_function_call_hooks(
         &self,
         hooks: &[Arc<dyn FunctionCallHook>],
-        context: FunctionCallHookContext,
+        context: &FunctionCallHookContext,
         result: FunctionCallHookResult,
         on_event: &mut TurnEventHandler<'_>,
     ) {
         for hook in hooks.iter().rev() {
             if let Err(error) = hook
-                .after_call(context.clone(), result.clone(), on_event)
+                .after_call((*context).clone(), result.clone(), on_event)
                 .await
             {
                 tracing::warn!(error = %error, "function call post-hook failed");
