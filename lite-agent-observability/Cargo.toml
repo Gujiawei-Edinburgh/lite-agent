@@ -4,7 +4,14 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+lite-agent-runtime = { path = "../lite-agent-runtime" }
+serde_json = "1"
 thiserror = "2"
 tracing = "0.1"
 tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+
+[dev-dependencies]
+lite-agent-kernel = { path = "../lite-agent-kernel" }
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

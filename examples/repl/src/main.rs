@@ -1,12 +1,12 @@
 use lite_agent_kernel::model::{FunctionSpec, ModelRequest, ModelResponse};
 use lite_agent_kernel::ChatMessage;
-use lite_agent_observability::init_file_logging;
+use lite_agent_observability::{init_file_logging, JsonlTraceCollector};
 use lite_agent_openai::{ChatCompletionsClient, ModelConfig};
 use lite_agent_runtime::functions::{FunctionExecution, SimpleFunction};
 use lite_agent_runtime::{
     builtin_registry, turn_abort_pair, Agent, AgentConfig, AgentError, CompactingContextBuilder,
     CompactionInput, ContextCompactor, FunctionContext, FunctionRegistry, ModelClient, Result,
-    ThreadStore, TurnModelEvent, TurnOutcome, TurnStateEvent, TurnStreamEvent,
+    ThreadStore, TraceCollector, TurnModelEvent, TurnOutcome, TurnStateEvent, TurnStreamEvent,
 };
 use lite_agent_store_json::JsonFileThreadStore;
 use rustyline::error::ReadlineError;
@@ -49,6 +49,7 @@ async fn main() -> Result<()> {
     let _logging_guard = init_file_logging(&args.state_dir)
         .map_err(|error| AgentError::Logging(error.to_string()))?;
     let store = Arc::new(JsonFileThreadStore::open(&args.state_dir)?);
+    let trace_collector = Arc::new(JsonlTraceCollector::new(&args.state_dir)?);
     let model_client = Arc::new(ChatCompletionsClient::new(ModelConfig {
         base_url: args.base_url,
         api_key: args.api_key,
@@ -61,13 +62,16 @@ async fn main() -> Result<()> {
         model_client.clone(),
         example_registry(args.command_cwd),
     )
+    .with_shared_trace_collector(trace_collector.clone())
     .with_context_builder(CompactingContextBuilder::default().with_compactor(
         ExampleContextCompactor {
             model: model_client,
         },
     ));
 
-    run_repl(agent, store, thread_id).await
+    let result = run_repl(agent, store, thread_id).await;
+    trace_collector.flush().await;
+    result
 }
 
 fn example_registry(command_cwd: PathBuf) -> FunctionRegistry {

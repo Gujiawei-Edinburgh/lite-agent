@@ -4,6 +4,7 @@ pub mod error;
 pub mod functions;
 pub mod model;
 pub mod store;
+pub mod trace;
 
 pub use agent_loop::{
     turn_abort_pair, Agent, AgentConfig, FunctionCallHook, FunctionCallHookContext,
@@ -23,3 +24,4 @@ pub use model::{
     FunctionSpec, ModelClient, ModelFunctionCall, ModelRequest, ModelResponse, ModelStreamEvent,
 };
 pub use store::{SessionLock, ThreadContextCache, ThreadStore};
+pub use trace::{NoopTraceCollector, TraceCollector, TraceEvent, TraceEventKind, TraceTurnStatus};

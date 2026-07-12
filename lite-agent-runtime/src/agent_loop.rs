@@ -3,6 +3,9 @@ use crate::error::{AgentError, Result};
 use crate::functions::{FunctionContext, FunctionExecution, FunctionRegistry, ThreadUpdate};
 use crate::model::{ModelClient, ModelRequest, ModelResponse, ModelStreamEvent};
 use crate::store::{ThreadContextCache, ThreadStore};
+use crate::trace::{
+    NoopTraceCollector, TraceCollector, TraceEvent, TraceEventKind, TraceTurnStatus,
+};
 use lite_agent_kernel::events::{
     Suspension, Thread, TokenUsage, ToolResult, Turn, TurnId, TurnItem, TurnItemKind,
     TurnItemSource, TurnStatus,
@@ -232,6 +235,7 @@ pub struct Agent {
     function_registry: FunctionRegistry,
     function_call_hooks: Vec<Arc<dyn FunctionCallHook>>,
     context_builder: Arc<dyn ContextBuilder>,
+    trace_collector: Arc<dyn TraceCollector>,
 }
 
 impl Agent {
@@ -248,6 +252,7 @@ impl Agent {
             function_registry,
             function_call_hooks: Vec::new(),
             context_builder: Arc::new(CompactingContextBuilder::default()),
+            trace_collector: Arc::new(NoopTraceCollector),
         }
     }
 
@@ -269,6 +274,19 @@ impl Agent {
         C: ContextBuilder + 'static,
     {
         self.context_builder = Arc::new(context_builder);
+        self
+    }
+
+    pub fn with_trace_collector<C>(mut self, trace_collector: C) -> Self
+    where
+        C: TraceCollector + 'static,
+    {
+        self.trace_collector = Arc::new(trace_collector);
+        self
+    }
+
+    pub fn with_shared_trace_collector(mut self, trace_collector: Arc<dyn TraceCollector>) -> Self {
+        self.trace_collector = trace_collector;
         self
     }
 
@@ -310,6 +328,7 @@ impl Agent {
         tracing::debug!(thread_id, "session lock acquired");
 
         let user_text = user_text.into();
+        let trace_user_text = user_text.clone();
         let runtime_context = self
             .config
             .runtime_context_provider
@@ -336,12 +355,22 @@ impl Agent {
             TurnItemSource::User,
             TurnItemKind::UserInput {
                 text: user_text,
-                response_to,
+                response_to: response_to.clone(),
             },
         ));
         thread.turns.push(turn);
         thread = self.commit_thread(thread).await?;
         tracing::info!(thread_id, turn_id, "turn started");
+        let mut trace_sequence = 0;
+        self.record_trace(
+            &mut trace_sequence,
+            thread_id,
+            &turn_id,
+            TraceEventKind::UserInput {
+                text: trace_user_text,
+                response_to,
+            },
+        );
         on_event(TurnStreamEvent::State(TurnStateEvent::TurnStarted {
             thread_id: thread_id.to_string(),
             turn_id: turn_id.clone(),
@@ -430,6 +459,10 @@ impl Agent {
                                 text: text.clone(),
                             }));
                         }
+                        let trace_model_response = TraceEventKind::ModelResponse {
+                            text: text.clone(),
+                            function_calls: function_calls.clone(),
+                        };
                         Self::push_turn_items(
                             &mut thread,
                             &session.active_turn_id,
@@ -449,6 +482,12 @@ impl Agent {
                                 TurnStatus::Completed,
                             )?;
                             thread = self.commit_thread(thread).await?;
+                            self.record_trace(
+                                &mut trace_sequence,
+                                thread_id,
+                                &session.active_turn_id,
+                                trace_model_response,
+                            );
                             break 'turn_loop TurnOutcome::AssistantMessage { text };
                         }
                         let calls = function_calls;
@@ -465,6 +504,12 @@ impl Agent {
                             },
                         ));
                         thread = self.commit_thread(thread).await?;
+                        self.record_trace(
+                            &mut trace_sequence,
+                            thread_id,
+                            &session.active_turn_id,
+                            trace_model_response,
+                        );
 
                         for (call_index, call) in calls.iter().enumerate() {
                             let call_id = call.call_id.clone();
@@ -473,6 +518,16 @@ impl Agent {
                                 call_id: call_id.clone(),
                                 name: name.clone(),
                             }));
+                            self.record_trace(
+                                &mut trace_sequence,
+                                thread_id,
+                                &turn_id,
+                                TraceEventKind::FunctionCall {
+                                    call_id: call_id.clone(),
+                                    name: name.clone(),
+                                    arguments: call.arguments.clone(),
+                                },
+                            );
                             let mut hook_context = FunctionCallHookContext {
                                 thread_id: thread.id.clone(),
                                 turn_id: turn_id.clone(),
@@ -526,6 +581,13 @@ impl Agent {
                                     let hook_result = FunctionCallHookResult::Completed {
                                         output: output.clone(),
                                     };
+                                    let trace_tool_output = TraceEventKind::ToolOutput {
+                                        call_id: call_id.clone(),
+                                        name: name.clone(),
+                                        result: ToolResult::Success {
+                                            output: output.clone(),
+                                        },
+                                    };
                                     let mut func_items =
                                         update_item.into_iter().collect::<Vec<_>>();
                                     func_items.push(TurnItem::new(
@@ -538,6 +600,12 @@ impl Agent {
                                     ));
                                     Self::push_turn_items(&mut thread, &turn_id, func_items)?;
                                     thread = self.commit_thread(thread).await?;
+                                    self.record_trace(
+                                        &mut trace_sequence,
+                                        thread_id,
+                                        &turn_id,
+                                        trace_tool_output,
+                                    );
                                     hook_context.projection =
                                         ThreadProjection::from_thread(&thread);
                                     self.run_after_function_call_hooks(
@@ -561,6 +629,13 @@ impl Agent {
                                     let hook_result = FunctionCallHookResult::Suspended {
                                         suspension: suspension.clone(),
                                         output: output.clone(),
+                                    };
+                                    let trace_tool_output = TraceEventKind::ToolOutput {
+                                        call_id: call_id.clone(),
+                                        name: name.clone(),
+                                        result: ToolResult::Success {
+                                            output: output.clone(),
+                                        },
                                     };
                                     let mut func_items =
                                         update_item.into_iter().collect::<Vec<_>>();
@@ -607,6 +682,26 @@ impl Agent {
                                         TurnStatus::Suspended,
                                     )?;
                                     thread = self.commit_thread(thread).await?;
+                                    self.record_trace(
+                                        &mut trace_sequence,
+                                        thread_id,
+                                        &turn_id,
+                                        trace_tool_output,
+                                    );
+                                    for (skipped_call_id, skipped_name, error) in &skipped_calls {
+                                        self.record_trace(
+                                            &mut trace_sequence,
+                                            thread_id,
+                                            &turn_id,
+                                            TraceEventKind::ToolOutput {
+                                                call_id: skipped_call_id.clone(),
+                                                name: skipped_name.clone(),
+                                                result: ToolResult::Error {
+                                                    error: error.clone(),
+                                                },
+                                            },
+                                        );
+                                    }
                                     hook_context.projection =
                                         ThreadProjection::from_thread(&thread);
                                     self.run_after_function_call_hooks(
@@ -641,6 +736,13 @@ impl Agent {
                                     let hook_result = FunctionCallHookResult::Failed {
                                         error: error_text.clone(),
                                     };
+                                    let trace_tool_output = TraceEventKind::ToolOutput {
+                                        call_id: call_id.clone(),
+                                        name: name.clone(),
+                                        result: ToolResult::Error {
+                                            error: error_text.clone(),
+                                        },
+                                    };
                                     Self::push_turn_items(
                                         &mut thread,
                                         &turn_id,
@@ -656,6 +758,12 @@ impl Agent {
                                         )],
                                     )?;
                                     thread = self.commit_thread(thread).await?;
+                                    self.record_trace(
+                                        &mut trace_sequence,
+                                        thread_id,
+                                        &turn_id,
+                                        trace_tool_output,
+                                    );
                                     hook_context.projection =
                                         ThreadProjection::from_thread(&thread);
                                     self.run_after_function_call_hooks(
@@ -691,6 +799,20 @@ impl Agent {
 
         Self::apply_turn_token_usage(&mut thread, turn_token_usage);
         self.commit_thread(thread).await?;
+        let trace_status = match &outcome {
+            TurnOutcome::AssistantMessage { .. } => TraceTurnStatus::Completed,
+            TurnOutcome::Suspended { .. } => TraceTurnStatus::Suspended,
+            TurnOutcome::Failed { .. } => TraceTurnStatus::Failed,
+            TurnOutcome::Aborted { .. } => TraceTurnStatus::Aborted,
+        };
+        self.record_trace(
+            &mut trace_sequence,
+            thread_id,
+            &turn_id,
+            TraceEventKind::TurnFinished {
+                status: trace_status,
+            },
+        );
         if let TurnOutcome::Failed { error } = &outcome {
             on_event(TurnStreamEvent::State(TurnStateEvent::TurnFailed {
                 error: error.clone(),
@@ -712,6 +834,23 @@ impl Agent {
         if !usage.is_zero() {
             thread.token_usage.add_assign(usage);
         }
+    }
+
+    fn record_trace(
+        &self,
+        sequence: &mut u64,
+        thread_id: &str,
+        turn_id: &str,
+        kind: TraceEventKind,
+    ) {
+        *sequence = sequence.saturating_add(1);
+        self.trace_collector.record(TraceEvent {
+            thread_id: thread_id.to_string(),
+            turn_id: turn_id.to_string(),
+            sequence: *sequence,
+            occurred_at: lite_agent_kernel::now_timestamp(),
+            kind,
+        });
     }
 
     async fn await_step_or_abort<T, F>(

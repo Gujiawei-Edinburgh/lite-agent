@@ -756,7 +756,12 @@ dependencies = [
 name = "lite-agent-observability"
 version = "0.1.0"
 dependencies = [
+ "lite-agent-kernel",
+ "lite-agent-runtime",
+ "serde_json",
+ "tempfile",
  "thiserror",
+ "tokio",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
