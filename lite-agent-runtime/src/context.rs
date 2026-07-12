@@ -1,7 +1,7 @@
 use crate::error::{AgentError, Result};
-use crate::projection::{ChatMessage, ThreadProjection};
 use crate::store::ThreadContextCache;
 use chrono::{Local, Utc};
+use lite_agent_kernel::projection::{ChatMessage, ThreadProjection};
 use serde_json::Value;
 use std::future::Future;
 use std::pin::Pin;
@@ -347,8 +347,8 @@ mod tests {
         ChatMessage, CompactingContextBuilder, CompactionInput, ContextBuildInput, ContextBuilder,
         ContextCompactor,
     };
-    use crate::projection::ThreadProjection;
     use crate::Result;
+    use lite_agent_kernel::projection::ThreadProjection;
     use std::future::Future;
     use std::pin::Pin;
     use std::sync::{

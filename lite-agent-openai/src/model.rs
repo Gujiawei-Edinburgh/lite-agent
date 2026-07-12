@@ -1,9 +1,12 @@
-use crate::error::{AgentError, Result};
-use crate::events::TokenUsage;
-use crate::projection::ChatMessage;
 use futures_util::StreamExt;
+use lite_agent_kernel::events::TokenUsage;
+use lite_agent_kernel::projection::ChatMessage;
+use lite_agent_kernel::{
+    FunctionSpec, ModelFunctionCall, ModelRequest, ModelResponse, ModelStreamEvent,
+};
+use lite_agent_runtime::model::{ModelClient, ModelStreamHandler};
+use lite_agent_runtime::{AgentError, Result};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
@@ -20,56 +23,6 @@ impl ModelConfig {
     pub fn default_reasoning_effort() -> String {
         "medium".to_string()
     }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct FunctionSpec {
-    pub name: String,
-    pub description: String,
-    pub parameters: Value,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct ModelRequest {
-    pub messages: Vec<ChatMessage>,
-    pub functions: Vec<FunctionSpec>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub enum ModelResponse {
-    Assistant {
-        text: Option<String>,
-        function_calls: Vec<ModelFunctionCall>,
-    },
-    AssistantMessage {
-        text: String,
-    },
-    FunctionCalls {
-        calls: Vec<ModelFunctionCall>,
-    },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct ModelFunctionCall {
-    pub call_id: String,
-    pub name: String,
-    pub arguments: Value,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum ModelStreamEvent {
-    AssistantDelta { text: String },
-    TokenUsage { usage: TokenUsage },
-}
-
-pub type ModelStreamHandler<'a> = dyn FnMut(ModelStreamEvent) + Send + 'a;
-
-pub trait ModelClient: Send + Sync {
-    fn stream_complete<'a>(
-        &'a self,
-        request: ModelRequest,
-        on_event: &'a mut ModelStreamHandler<'a>,
-    ) -> Pin<Box<dyn Future<Output = Result<ModelResponse>> + Send + 'a>>;
 }
 
 #[derive(Debug, Clone)]
@@ -110,10 +63,14 @@ impl ModelClient for ChatCompletionsClient {
                 .bearer_auth(&self.config.api_key)
                 .json(&body)
                 .send()
-                .await?;
+                .await
+                .map_err(|error| AgentError::Http(error.to_string()))?;
             let status = response.status();
             if !status.is_success() {
-                let raw = response.text().await?;
+                let raw = response
+                    .text()
+                    .await
+                    .map_err(|error| AgentError::Http(error.to_string()))?;
                 return Err(AgentError::Http(format!(
                     "HTTP status {status} for streamed chat/completions: {raw}"
                 )));
@@ -125,7 +82,7 @@ impl ModelClient for ChatCompletionsClient {
             let mut tool_calls = BTreeMap::<usize, PartialToolCall>::new();
 
             while let Some(chunk) = stream.next().await {
-                let chunk = chunk?;
+                let chunk = chunk.map_err(|error| AgentError::Http(error.to_string()))?;
                 buffer.extend_from_slice(&chunk);
                 consume_sse_frames(&mut buffer, &mut assistant_text, &mut tool_calls, on_event)?;
             }
@@ -481,7 +438,7 @@ struct OpenAiStreamFunctionDelta {
 mod tests {
     use super::{consume_sse_frames, handle_sse_frame, ModelStreamEvent, PartialToolCall};
     use super::{FunctionSpec, ModelFunctionCall, ModelRequest, OpenAiChatRequest};
-    use crate::projection::ChatMessage;
+    use lite_agent_kernel::projection::ChatMessage;
     use serde_json::{json, Value};
     use std::collections::BTreeMap;
 

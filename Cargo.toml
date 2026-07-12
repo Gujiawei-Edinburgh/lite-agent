@@ -1,3 +1,10 @@
 [workspace]
-members = ["lite-agent-core", "examples/repl"]
+members = [
+    "lite-agent-kernel",
+    "lite-agent-runtime",
+    "lite-agent-openai",
+    "lite-agent-store-json",
+    "lite-agent-observability",
+    "examples/repl",
+]
 resolver = "2"

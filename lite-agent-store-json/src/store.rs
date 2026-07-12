@@ -1,6 +1,6 @@
-use crate::error::{AgentError, Result};
-use crate::events::Thread;
 use fs2::FileExt;
+use lite_agent_kernel::events::{new_id, Thread};
+use lite_agent_runtime::{AgentError, Result, SessionLock, ThreadContextCache, ThreadStore};
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::future::Future;
@@ -10,50 +10,13 @@ use std::sync::Arc;
 use tokio::fs;
 use tokio::sync::Mutex as AsyncMutex;
 
-pub type SessionLock = Arc<AsyncMutex<()>>;
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
-pub struct ThreadContextCache {
-    pub thread_id: String,
-    pub source_version: u64,
-    pub policy_version: String,
-    pub covered_message_count: usize,
-    pub summary: String,
-}
-
-pub trait ThreadStore: Send + Sync {
-    /// Load one durable thread snapshot.
-    fn load<'a>(
-        &'a self,
-        thread_id: &'a str,
-    ) -> Pin<Box<dyn Future<Output = Result<Thread>> + Send + 'a>>;
-
-    fn commit<'a>(
-        &'a self,
-        thread: Thread,
-        expected_version: u64,
-    ) -> Pin<Box<dyn Future<Output = Result<Thread>> + Send + 'a>>;
-
-    fn session_lock(&self, thread_id: &str) -> SessionLock;
-
-    fn load_context_cache<'a>(
-        &'a self,
-        thread_id: &'a str,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<ThreadContextCache>>> + Send + 'a>>;
-
-    fn save_context_cache<'a>(
-        &'a self,
-        cache: ThreadContextCache,
-    ) -> Pin<Box<dyn Future<Output = Result<ThreadContextCache>> + Send + 'a>>;
-}
-
 /// Single-process JSON persistence intended for local development and examples.
 /// Production deployments should provide a repository with atomic/versioned commits.
 #[derive(Debug, Clone)]
 pub struct JsonFileThreadStore {
     state_dir: PathBuf,
     _lock: Arc<StoreLock>,
-    session_locks: Arc<std::sync::Mutex<BTreeMap<String, SessionLock>>>,
+    session_locks: Arc<std::sync::Mutex<std::collections::BTreeMap<String, SessionLock>>>,
     commit_lock: Arc<AsyncMutex<()>>,
 }
 
@@ -131,8 +94,7 @@ impl JsonFileThreadStore {
             fs::create_dir_all(parent).await?;
         }
         let raw = serde_json::to_string_pretty(thread)?;
-        let temporary_path =
-            path.with_extension(format!("json.{}.tmp", crate::events::new_id("write")));
+        let temporary_path = path.with_extension(format!("json.{}.tmp", new_id("write")));
         fs::write(&temporary_path, raw).await?;
         fs::rename(temporary_path, path).await?;
         Ok(())
@@ -144,8 +106,7 @@ impl JsonFileThreadStore {
             fs::create_dir_all(parent).await?;
         }
         let raw = serde_json::to_string_pretty(cache)?;
-        let temporary_path =
-            path.with_extension(format!("json.{}.tmp", crate::events::new_id("cache")));
+        let temporary_path = path.with_extension(format!("json.{}.tmp", new_id("cache")));
         fs::write(&temporary_path, raw).await?;
         fs::rename(temporary_path, path).await?;
         Ok(())
@@ -236,7 +197,10 @@ impl ThreadStore for JsonFileThreadStore {
 
 #[cfg(test)]
 mod tests {
-    use crate::events::{Thread, Turn, TurnItem, TurnItemKind, TurnItemSource, TurnStatus};
+    use lite_agent_kernel::{
+        GoalState, GoalStatus, Thread, Turn, TurnItem, TurnItemKind, TurnItemSource, TurnStatus,
+    };
+    use lite_agent_runtime::AgentError;
 
     use super::{JsonFileThreadStore, ThreadContextCache, ThreadStore};
 
@@ -307,7 +271,7 @@ mod tests {
         let error = store.load("../outside").await.expect_err("invalid id");
         assert!(matches!(
             error,
-            crate::AgentError::InvalidThreadId(value) if value == "../outside"
+            AgentError::InvalidThreadId(value) if value == "../outside"
         ));
     }
 
@@ -316,7 +280,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let first = JsonFileThreadStore::open(temp.path()).expect("first store");
         let error = JsonFileThreadStore::open(temp.path()).expect_err("second store");
-        assert!(matches!(error, crate::AgentError::StoreLocked(_)));
+        assert!(matches!(error, AgentError::StoreLocked(_)));
         drop(first);
         JsonFileThreadStore::open(temp.path()).expect("lock released after drop");
     }
@@ -330,9 +294,9 @@ mod tests {
 
         let stale = store.load("t1").await.expect("load");
         let mut current = stale.clone();
-        current.goal = Some(crate::events::GoalState {
+        current.goal = Some(GoalState {
             objective: "first".to_string(),
-            status: crate::events::GoalStatus::Active,
+            status: GoalStatus::Active,
             notes: None,
         });
         let committed = store.commit(current, stale.version).await.expect("commit");
@@ -341,7 +305,7 @@ mod tests {
         let error = store.commit(stale, 1).await.expect_err("stale commit");
         assert!(matches!(
             error,
-            crate::AgentError::VersionConflict {
+            AgentError::VersionConflict {
                 expected: 1,
                 actual: 2,
                 ..

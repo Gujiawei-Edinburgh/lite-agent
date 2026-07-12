@@ -1,0 +1,15 @@
+[package]
+name = "lite-agent-openai"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+lite-agent-kernel = { path = "../lite-agent-kernel" }
+lite-agent-runtime = { path = "../lite-agent-runtime" }
+futures-util = "0.3"
+reqwest = { version = "0.13", features = ["json", "stream"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

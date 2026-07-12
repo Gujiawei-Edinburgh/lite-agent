@@ -1,8 +1,8 @@
 use crate::agent_loop::TurnAbortSignal;
 use crate::error::{AgentError, Result};
-use crate::events::{new_id, GoalState, GoalStatus, Suspension};
 use crate::model::FunctionSpec;
-use crate::projection::ThreadProjection;
+use lite_agent_kernel::events::{new_id, GoalState, GoalStatus, Suspension, SuspensionKind};
+use lite_agent_kernel::projection::ThreadProjection;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -245,7 +245,7 @@ impl AgentFunction for AskUser {
             Ok(FunctionExecution::Suspended {
                 suspension: Suspension {
                     id: request_id.clone(),
-                    kind: crate::events::SuspensionKind::UserInput,
+                    kind: SuspensionKind::UserInput,
                     payload: json!({ "prompt": parsed.prompt.clone() }),
                 },
                 output: json!({
@@ -261,8 +261,8 @@ impl AgentFunction for AskUser {
 
 #[cfg(test)]
 mod tests {
-    use crate::events::{GoalStatus, Thread};
-    use crate::projection::ThreadProjection;
+    use lite_agent_kernel::events::{GoalStatus, SuspensionKind, Thread};
+    use lite_agent_kernel::projection::ThreadProjection;
 
     use super::{builtin_registry, FunctionContext, FunctionExecution, ThreadUpdate};
     use serde_json::json;
@@ -315,7 +315,7 @@ mod tests {
         let FunctionExecution::Suspended { suspension, .. } = execution else {
             panic!("expected waiting");
         };
-        assert_eq!(suspension.kind, crate::events::SuspensionKind::UserInput);
+        assert_eq!(suspension.kind, SuspensionKind::UserInput);
         assert_eq!(suspension.payload["prompt"], "Which thread?");
     }
 }

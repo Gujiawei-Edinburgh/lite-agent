@@ -1,12 +1,14 @@
-use lite_agent_core::functions::{FunctionExecution, SimpleFunction};
-use lite_agent_core::model::{FunctionSpec, ModelRequest, ModelResponse};
-use lite_agent_core::FunctionContext;
-use lite_agent_core::{
-    builtin_registry, init_file_logging, turn_abort_pair, Agent, AgentConfig,
-    ChatCompletionsClient, ChatMessage, CompactingContextBuilder, CompactionInput,
-    ContextCompactor, FunctionRegistry, JsonFileThreadStore, ModelClient, ModelConfig, Result,
+use lite_agent_kernel::model::{FunctionSpec, ModelRequest, ModelResponse};
+use lite_agent_kernel::ChatMessage;
+use lite_agent_observability::init_file_logging;
+use lite_agent_openai::{ChatCompletionsClient, ModelConfig};
+use lite_agent_runtime::functions::{FunctionExecution, SimpleFunction};
+use lite_agent_runtime::{
+    builtin_registry, turn_abort_pair, Agent, AgentConfig, AgentError, CompactingContextBuilder,
+    CompactionInput, ContextCompactor, FunctionContext, FunctionRegistry, ModelClient, Result,
     ThreadStore, TurnModelEvent, TurnOutcome, TurnStateEvent, TurnStreamEvent,
 };
+use lite_agent_store_json::JsonFileThreadStore;
 use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
 use serde_json::json;
@@ -36,15 +38,16 @@ enum Command {
 }
 
 #[tokio::main]
-async fn main() -> lite_agent_core::Result<()> {
+async fn main() -> Result<()> {
     let Command::Repl(args) = parse_args()? else {
         println!("{}", help_text());
         return Ok(());
     };
     let thread_id = args
         .thread
-        .unwrap_or_else(|| lite_agent_core::events::new_id("thread"));
-    let _logging_guard = init_file_logging(&args.state_dir)?;
+        .unwrap_or_else(|| lite_agent_kernel::new_id("thread"));
+    let _logging_guard = init_file_logging(&args.state_dir)
+        .map_err(|error| AgentError::Logging(error.to_string()))?;
     let store = Arc::new(JsonFileThreadStore::open(&args.state_dir)?);
     let model_client = Arc::new(ChatCompletionsClient::new(ModelConfig {
         base_url: args.base_url,
@@ -119,7 +122,7 @@ impl ContextCompactor for ExampleContextCompactor {
                     text: Some(text), ..
                 }
                 | ModelResponse::AssistantMessage { text } => Ok(text),
-                _ => Err(lite_agent_core::AgentError::Model(
+                _ => Err(AgentError::Model(
                     "context compactor model returned no summary".to_string(),
                 )),
             }
@@ -127,7 +130,9 @@ impl ContextCompactor for ExampleContextCompactor {
     }
 }
 
-fn exec_command_function(command_cwd: PathBuf) -> impl lite_agent_core::functions::AgentFunction {
+fn exec_command_function(
+    command_cwd: PathBuf,
+) -> impl lite_agent_runtime::functions::AgentFunction {
     SimpleFunction::new(
         FunctionSpec {
             name: "exec_command".to_string(),
@@ -159,7 +164,7 @@ fn exec_command_function(command_cwd: PathBuf) -> impl lite_agent_core::function
                 let cmd = args
                     .get("cmd")
                     .and_then(|value| value.as_str())
-                    .ok_or_else(|| lite_agent_core::AgentError::InvalidFunctionArguments {
+                    .ok_or_else(|| AgentError::InvalidFunctionArguments {
                         name: "exec_command".to_string(),
                         message: "missing string field: cmd".to_string(),
                     })?
@@ -179,21 +184,17 @@ fn exec_command_function(command_cwd: PathBuf) -> impl lite_agent_core::function
     )
 }
 
-async fn run_shell_command(
-    cwd: &Path,
-    cmd: &str,
-    timeout_ms: u64,
-) -> lite_agent_core::Result<serde_json::Value> {
+async fn run_shell_command(cwd: &Path, cmd: &str, timeout_ms: u64) -> Result<serde_json::Value> {
     let mut command = TokioCommand::new("/bin/zsh");
     command.arg("-lc").arg(cmd).current_dir(cwd);
 
     let output = timeout(Duration::from_millis(timeout_ms), command.output())
         .await
-        .map_err(|_| lite_agent_core::AgentError::Function {
+        .map_err(|_| AgentError::Function {
             name: "exec_command".to_string(),
             message: format!("command timed out after {timeout_ms}ms"),
         })?
-        .map_err(|error| lite_agent_core::AgentError::Function {
+        .map_err(|error| AgentError::Function {
             name: "exec_command".to_string(),
             message: error.to_string(),
         })?;
@@ -218,14 +219,14 @@ fn truncate_output(output: &str) -> String {
     truncated
 }
 
-fn parse_args() -> lite_agent_core::Result<Command> {
+fn parse_args() -> Result<Command> {
     let mut args = env::args().skip(1);
     let command = args.next().unwrap_or_else(|| "repl".to_string());
     if command == "--help" || command == "-h" {
         return Ok(Command::Help);
     }
     if command != "repl" {
-        return Err(lite_agent_core::AgentError::Model(format!(
+        return Err(AgentError::Model(format!(
             "unsupported command: {command}. expected: repl"
         )));
     }
@@ -255,20 +256,18 @@ fn parse_args() -> lite_agent_core::Result<Command> {
                 return Ok(Command::Help);
             }
             other => {
-                return Err(lite_agent_core::AgentError::Model(format!(
-                    "unknown argument: {other}"
-                )));
+                return Err(AgentError::Model(format!("unknown argument: {other}")));
             }
         }
     }
 
     if parsed.model.is_empty() {
-        return Err(lite_agent_core::AgentError::Model(
+        return Err(AgentError::Model(
             "missing --model or LITE_AGENT_MODEL".to_string(),
         ));
     }
     if parsed.api_key.is_empty() {
-        return Err(lite_agent_core::AgentError::Model(
+        return Err(AgentError::Model(
             "missing --api-key or LITE_AGENT_API_KEY".to_string(),
         ));
     }
@@ -288,14 +287,9 @@ fn help_text() -> String {
     .to_string()
 }
 
-async fn run_repl(
-    agent: Agent,
-    store: Arc<JsonFileThreadStore>,
-    thread_id: String,
-) -> lite_agent_core::Result<()> {
-    let mut editor = DefaultEditor::new().map_err(|error| {
-        lite_agent_core::AgentError::Model(format!("failed to initialize REPL: {error}"))
-    })?;
+async fn run_repl(agent: Agent, store: Arc<JsonFileThreadStore>, thread_id: String) -> Result<()> {
+    let mut editor = DefaultEditor::new()
+        .map_err(|error| AgentError::Model(format!("failed to initialize REPL: {error}")))?;
 
     println!("thread: {thread_id}");
 
@@ -305,9 +299,7 @@ async fn run_repl(
             Err(ReadlineError::Interrupted) => break,
             Err(ReadlineError::Eof) => break,
             Err(error) => {
-                return Err(lite_agent_core::AgentError::Model(format!(
-                    "failed to read input: {error}"
-                )));
+                return Err(AgentError::Model(format!("failed to read input: {error}")));
             }
         };
         let input = line.trim();
@@ -336,7 +328,7 @@ async fn run_repl(
         let outcome = tokio::select! {
             result = &mut turn => result?,
             signal = tokio::signal::ctrl_c() => {
-                signal.map_err(lite_agent_core::AgentError::Io)?;
+                signal.map_err(AgentError::Io)?;
                 abort_handle.abort();
                 let outcome = turn.await?;
                 println!();
@@ -371,15 +363,12 @@ async fn run_repl(
     Ok(())
 }
 
-async fn print_thread_token_usage(
-    store: Arc<JsonFileThreadStore>,
-    thread_id: &str,
-) -> lite_agent_core::Result<()> {
+async fn print_thread_token_usage(store: Arc<JsonFileThreadStore>, thread_id: &str) -> Result<()> {
     match store.load(thread_id).await {
         Ok(thread) => {
             println!("[thread tokens] {}", thread.token_usage);
         }
-        Err(lite_agent_core::AgentError::ThreadNotFound(_)) => {
+        Err(AgentError::ThreadNotFound(_)) => {
             println!("[thread tokens] input=0, cached_input=0, output=0, total=0");
         }
         Err(error) => return Err(error),
@@ -466,7 +455,7 @@ fn print_process_line(state: &mut StreamRenderState, line: &str) {
 #[cfg(test)]
 mod tests {
     use super::{print_stream_event, StreamRenderState};
-    use lite_agent_core::{TurnModelEvent, TurnStreamEvent};
+    use lite_agent_runtime::{TurnModelEvent, TurnStreamEvent};
 
     #[test]
     fn assistant_delta_marks_line_open_until_newline() {

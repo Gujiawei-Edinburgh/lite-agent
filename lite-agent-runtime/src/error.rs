@@ -38,9 +38,6 @@ pub enum AgentError {
     #[error("http error: {0}")]
     Http(String),
 
-    #[error("http client error: {0}")]
-    Reqwest(#[from] reqwest::Error),
-
     #[error("model error: {0}")]
     Model(String),
 

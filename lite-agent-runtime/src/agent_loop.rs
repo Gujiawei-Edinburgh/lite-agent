@@ -1,13 +1,13 @@
 use crate::context::{CompactingContextBuilder, ContextBuildInput, ContextBuilder};
 use crate::error::{AgentError, Result};
-use crate::events::{
+use crate::functions::{FunctionContext, FunctionExecution, FunctionRegistry, ThreadUpdate};
+use crate::model::{ModelClient, ModelRequest, ModelResponse, ModelStreamEvent};
+use crate::store::{ThreadContextCache, ThreadStore};
+use lite_agent_kernel::events::{
     Suspension, Thread, TokenUsage, ToolResult, Turn, TurnId, TurnItem, TurnItemKind,
     TurnItemSource, TurnStatus,
 };
-use crate::functions::{FunctionContext, FunctionExecution, FunctionRegistry, ThreadUpdate};
-use crate::model::{ModelClient, ModelRequest, ModelResponse, ModelStreamEvent};
-use crate::projection::ThreadProjection;
-use crate::store::{ThreadContextCache, ThreadStore};
+use lite_agent_kernel::projection::ThreadProjection;
 use serde_json::Value;
 use std::future::Future;
 use std::pin::Pin;
@@ -880,18 +880,18 @@ impl Agent {
 
 #[cfg(test)]
 mod tests {
-    use crate::events::{TokenUsage, ToolResult, TurnItemKind, TurnStatus};
     use crate::functions::builtin_registry;
     use crate::model::{
         ModelClient, ModelFunctionCall, ModelRequest, ModelResponse, ModelStreamEvent,
         ModelStreamHandler,
     };
-    use crate::store::{JsonFileThreadStore, ThreadStore};
+    use crate::store::{SessionLock, ThreadContextCache, ThreadStore};
     use crate::{
         turn_abort_pair, Agent, AgentConfig, AgentError, FunctionCallHook, FunctionCallHookContext,
         FunctionCallHookResult, Result, RuntimeContextInput, RuntimeContextProvider, RuntimeEvent,
         TurnOutcome, TurnStateEvent, TurnStreamEvent,
     };
+    use lite_agent_kernel::events::{TokenUsage, ToolResult, TurnItemKind, TurnStatus};
     use serde_json::json;
     use std::collections::VecDeque;
     use std::future::Future;
@@ -899,6 +899,81 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use tokio::time::{sleep, Duration};
+
+    #[derive(Default)]
+    struct TestStore {
+        threads: Mutex<std::collections::BTreeMap<String, lite_agent_kernel::events::Thread>>,
+        caches: Mutex<std::collections::BTreeMap<String, ThreadContextCache>>,
+        locks: Mutex<std::collections::BTreeMap<String, SessionLock>>,
+    }
+
+    impl ThreadStore for TestStore {
+        fn load<'a>(
+            &'a self,
+            thread_id: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<lite_agent_kernel::events::Thread>> + Send + 'a>>
+        {
+            Box::pin(async move {
+                self.threads
+                    .lock()
+                    .expect("threads")
+                    .get(thread_id)
+                    .cloned()
+                    .ok_or_else(|| AgentError::ThreadNotFound(thread_id.to_string()))
+            })
+        }
+
+        fn commit<'a>(
+            &'a self,
+            mut thread: lite_agent_kernel::events::Thread,
+            expected_version: u64,
+        ) -> Pin<Box<dyn Future<Output = Result<lite_agent_kernel::events::Thread>> + Send + 'a>>
+        {
+            Box::pin(async move {
+                let mut threads = self.threads.lock().expect("threads");
+                let current_version = threads.get(&thread.id).map_or(0, |current| current.version);
+                if current_version != expected_version {
+                    return Err(AgentError::VersionConflict {
+                        thread_id: thread.id.clone(),
+                        expected: expected_version,
+                        actual: current_version,
+                    });
+                }
+                thread.version = expected_version.saturating_add(1);
+                thread.touch();
+                threads.insert(thread.id.clone(), thread.clone());
+                Ok(thread)
+            })
+        }
+
+        fn session_lock(&self, thread_id: &str) -> SessionLock {
+            let mut locks = self.locks.lock().expect("locks");
+            locks
+                .entry(thread_id.to_string())
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                .clone()
+        }
+
+        fn load_context_cache<'a>(
+            &'a self,
+            thread_id: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<Option<ThreadContextCache>>> + Send + 'a>> {
+            Box::pin(async move { Ok(self.caches.lock().expect("caches").get(thread_id).cloned()) })
+        }
+
+        fn save_context_cache<'a>(
+            &'a self,
+            cache: ThreadContextCache,
+        ) -> Pin<Box<dyn Future<Output = Result<ThreadContextCache>> + Send + 'a>> {
+            Box::pin(async move {
+                self.caches
+                    .lock()
+                    .expect("caches")
+                    .insert(cache.thread_id.clone(), cache.clone());
+                Ok(cache)
+            })
+        }
+    }
 
     struct MockModel {
         responses: Mutex<VecDeque<ModelResponse>>,
@@ -1064,8 +1139,7 @@ mod tests {
 
     #[tokio::test]
     async fn simple_assistant_message_ends_turn() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let store = Arc::new(JsonFileThreadStore::open(temp.path()).expect("store"));
+        let store = Arc::new(TestStore::default());
         let agent = agent_with(
             store.clone(),
             vec![ModelResponse::AssistantMessage {
@@ -1088,8 +1162,7 @@ mod tests {
 
     #[tokio::test]
     async fn empty_model_response_fails_turn() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let store = Arc::new(JsonFileThreadStore::open(temp.path()).expect("store"));
+        let store = Arc::new(TestStore::default());
         let agent = agent_with(
             store.clone(),
             vec![ModelResponse::Assistant {
@@ -1108,8 +1181,7 @@ mod tests {
 
     #[tokio::test]
     async fn persists_assistant_text_when_response_also_requests_tools() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let store = Arc::new(JsonFileThreadStore::open(temp.path()).expect("store"));
+        let store = Arc::new(TestStore::default());
         let agent = agent_with(
             store.clone(),
             vec![
@@ -1146,8 +1218,7 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_turns_for_same_thread_are_serialized() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let store = Arc::new(JsonFileThreadStore::open(temp.path()).expect("store"));
+        let store = Arc::new(TestStore::default());
         let active = Arc::new(AtomicUsize::new(0));
         let max_active = Arc::new(AtomicUsize::new(0));
         let agent = Arc::new(Agent::new(
@@ -1176,8 +1247,7 @@ mod tests {
 
     #[tokio::test]
     async fn abort_during_model_request_persists_aborted_turn() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let store = Arc::new(JsonFileThreadStore::open(temp.path()).expect("store"));
+        let store = Arc::new(TestStore::default());
         let agent = Arc::new(Agent::new(
             AgentConfig::default(),
             store.clone(),
@@ -1228,8 +1298,7 @@ mod tests {
 
     #[tokio::test]
     async fn model_request_includes_current_time_context() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let store = Arc::new(JsonFileThreadStore::open(temp.path()).expect("store"));
+        let store = Arc::new(TestStore::default());
         let agent = agent_with(
             store,
             vec![ModelResponse::AssistantMessage {
@@ -1241,7 +1310,8 @@ mod tests {
             .model_request_from_projection("t", 0, Default::default(), None, None)
             .await
             .expect("context");
-        let Some(crate::projection::ChatMessage::System { content }) = request.messages.first()
+        let Some(lite_agent_kernel::projection::ChatMessage::System { content }) =
+            request.messages.first()
         else {
             panic!("missing system message");
         };
@@ -1264,8 +1334,7 @@ mod tests {
             }
         }
 
-        let temp = tempfile::tempdir().expect("tempdir");
-        let store = Arc::new(JsonFileThreadStore::open(temp.path()).expect("store"));
+        let store = Arc::new(TestStore::default());
         let model = Arc::new(MockModel::new(vec![ModelResponse::AssistantMessage {
             text: "hello".to_string(),
         }]));
@@ -1288,7 +1357,7 @@ mod tests {
                 .messages
                 .iter()
                 .find_map(|message| match message {
-                    crate::projection::ChatMessage::System { content } => Some(content),
+                    lite_agent_kernel::projection::ChatMessage::System { content } => Some(content),
                     _ => None,
                 })
                 .expect("system message")
@@ -1305,8 +1374,7 @@ mod tests {
 
     #[tokio::test]
     async fn stream_emits_intermediate_and_final_events() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let store = Arc::new(JsonFileThreadStore::open(temp.path()).expect("store"));
+        let store = Arc::new(TestStore::default());
         let agent = agent_with(
             store,
             vec![
@@ -1375,8 +1443,7 @@ mod tests {
             }
         }
 
-        let temp = tempfile::tempdir().expect("tempdir");
-        let store = Arc::new(JsonFileThreadStore::open(temp.path()).expect("store"));
+        let store = Arc::new(TestStore::default());
         let agent = Agent::new(
             AgentConfig::default(),
             store.clone(),
@@ -1417,8 +1484,7 @@ mod tests {
 
     #[tokio::test]
     async fn update_goal_then_message() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let store = Arc::new(JsonFileThreadStore::open(temp.path()).expect("store"));
+        let store = Arc::new(TestStore::default());
         let agent = agent_with(
             store.clone(),
             vec![
@@ -1455,8 +1521,7 @@ mod tests {
 
     #[tokio::test]
     async fn ask_user_stops_turn() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let store = Arc::new(JsonFileThreadStore::open(temp.path()).expect("store"));
+        let store = Arc::new(TestStore::default());
         let agent = agent_with(
             store.clone(),
             vec![ModelResponse::FunctionCalls {
@@ -1495,8 +1560,7 @@ mod tests {
 
     #[tokio::test]
     async fn function_failure_becomes_tool_error() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let store = Arc::new(JsonFileThreadStore::open(temp.path()).expect("store"));
+        let store = Arc::new(TestStore::default());
         let agent = agent_with(
             store.clone(),
             vec![
@@ -1527,8 +1591,7 @@ mod tests {
 
     #[tokio::test]
     async fn function_call_hooks_are_stacked_in_order() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let store = Arc::new(JsonFileThreadStore::open(temp.path()).expect("store"));
+        let store = Arc::new(TestStore::default());
         let hook_events = Arc::new(Mutex::new(Vec::new()));
         let agent = agent_with(
             store,
@@ -1564,8 +1627,7 @@ mod tests {
 
     #[tokio::test]
     async fn pre_hook_failure_blocks_function_and_records_tool_error() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let store = Arc::new(JsonFileThreadStore::open(temp.path()).expect("store"));
+        let store = Arc::new(TestStore::default());
         let hook_events = Arc::new(Mutex::new(Vec::new()));
         let agent = agent_with(
             store.clone(),
@@ -1617,8 +1679,7 @@ mod tests {
 
     #[tokio::test]
     async fn post_hook_failure_is_non_blocking_runtime_event() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let store = Arc::new(JsonFileThreadStore::open(temp.path()).expect("store"));
+        let store = Arc::new(TestStore::default());
         let hook_events = Arc::new(Mutex::new(Vec::new()));
         let agent = agent_with(
             store.clone(),
@@ -1676,8 +1737,7 @@ mod tests {
 
     #[tokio::test]
     async fn max_iterations_fails_turn() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let store = Arc::new(JsonFileThreadStore::open(temp.path()).expect("store"));
+        let store = Arc::new(TestStore::default());
         let agent = Agent::new(
             AgentConfig {
                 max_model_iterations: 1,

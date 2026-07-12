@@ -745,30 +745,75 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 
 [[package]]
-name = "lite-agent-core"
+name = "lite-agent-kernel"
 version = "0.1.0"
 dependencies = [
- "chrono",
- "fs2",
- "futures-util",
- "reqwest",
  "serde",
  "serde_json",
- "tempfile",
+]
+
+[[package]]
+name = "lite-agent-observability"
+version = "0.1.0"
+dependencies = [
  "thiserror",
- "tokio",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
 ]
 
 [[package]]
+name = "lite-agent-openai"
+version = "0.1.0"
+dependencies = [
+ "futures-util",
+ "lite-agent-kernel",
+ "lite-agent-runtime",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "lite-agent-repl"
 version = "0.1.0"
 dependencies = [
- "lite-agent-core",
+ "lite-agent-kernel",
+ "lite-agent-observability",
+ "lite-agent-openai",
+ "lite-agent-runtime",
+ "lite-agent-store-json",
  "rustyline",
  "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "lite-agent-runtime"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "futures-util",
+ "lite-agent-kernel",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "lite-agent-store-json"
+version = "0.1.0"
+dependencies = [
+ "fs2",
+ "lite-agent-kernel",
+ "lite-agent-runtime",
+ "serde",
+ "serde_json",
+ "tempfile",
  "tokio",
 ]
 
