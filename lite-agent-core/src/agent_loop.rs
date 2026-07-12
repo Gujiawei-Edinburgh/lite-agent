@@ -478,7 +478,7 @@ impl Agent {
                                 projection: projection.clone(),
                                 projection_after: None,
                             };
-                            let pre_hook_result = self
+                            let (entered_hooks, pre_hook_result) = self
                                 .run_before_function_call_hooks(hook_context.clone(), &mut on_event)
                                 .await;
                             let execution = match pre_hook_result {
@@ -539,6 +539,7 @@ impl Agent {
                                     after_context.projection_after =
                                         Some(ThreadProjection::from_thread(&thread));
                                     self.run_after_function_call_hooks(
+                                        &entered_hooks,
                                         after_context,
                                         hook_result,
                                         &mut on_event,
@@ -608,6 +609,7 @@ impl Agent {
                                     after_context.projection_after =
                                         Some(ThreadProjection::from_thread(&thread));
                                     self.run_after_function_call_hooks(
+                                        &entered_hooks,
                                         after_context,
                                         hook_result,
                                         &mut on_event,
@@ -657,6 +659,7 @@ impl Agent {
                                     after_context.projection_after =
                                         Some(ThreadProjection::from_thread(&thread));
                                     self.run_after_function_call_hooks(
+                                        &entered_hooks,
                                         after_context,
                                         hook_result,
                                         &mut on_event,
@@ -746,20 +749,25 @@ impl Agent {
         &self,
         context: FunctionCallHookContext,
         on_event: &mut TurnEventHandler<'_>,
-    ) -> Result<()> {
+    ) -> (Vec<Arc<dyn FunctionCallHook>>, Result<()>) {
+        let mut entered_hooks = Vec::new();
         for hook in &self.function_call_hooks {
-            hook.before_call(context.clone(), on_event).await?;
+            if let Err(error) = hook.before_call(context.clone(), on_event).await {
+                return (entered_hooks, Err(error));
+            }
+            entered_hooks.push(hook.clone());
         }
-        Ok(())
+        (entered_hooks, Ok(()))
     }
 
     async fn run_after_function_call_hooks(
         &self,
+        hooks: &[Arc<dyn FunctionCallHook>],
         context: FunctionCallHookContext,
         result: FunctionCallHookResult,
         on_event: &mut TurnEventHandler<'_>,
     ) {
-        for hook in &self.function_call_hooks {
+        for hook in hooks.iter().rev() {
             if let Err(error) = hook
                 .after_call(context.clone(), result.clone(), on_event)
                 .await
@@ -1528,8 +1536,8 @@ mod tests {
             vec![
                 "before:a:get_goal",
                 "before:b:get_goal",
-                "after:a:get_goal:completed",
                 "after:b:get_goal:completed",
+                "after:a:get_goal:completed",
             ]
         );
     }
@@ -1554,13 +1562,18 @@ mod tests {
                 },
             ],
         )
+        .with_function_call_hook(RecordingHook::new("audit", hook_events.clone()))
         .with_function_call_hook(RecordingHook::new("policy", hook_events.clone()).fail_before());
 
         let outcome = agent.run_turn("t", "goal?").await.expect("turn");
         assert!(matches!(outcome, TurnOutcome::AssistantMessage { .. }));
         assert_eq!(
             *hook_events.lock().expect("events"),
-            vec!["before:policy:get_goal", "after:policy:get_goal:failed"]
+            vec![
+                "before:audit:get_goal",
+                "before:policy:get_goal",
+                "after:audit:get_goal:failed",
+            ]
         );
 
         let thread = store.load("t").await.expect("thread");
