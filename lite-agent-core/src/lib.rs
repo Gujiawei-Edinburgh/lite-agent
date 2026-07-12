@@ -15,7 +15,7 @@ pub use agent_loop::{
 };
 pub use context::{
     ApproximateTokenEstimator, CompactingContextBuilder, CompactionInput, ContextBuildInput,
-    ContextBuildOutput, ContextBuilder, ContextCompactor, TokenEstimator,
+    ContextBuildOutput, ContextBuilder, ContextCompactor, OversizedGroupPolicy, TokenEstimator,
 };
 pub use error::{AgentError, Result};
 pub use events::{

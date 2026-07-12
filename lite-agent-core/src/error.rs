@@ -23,6 +23,9 @@ pub enum AgentError {
     #[error("context window exceeded: estimated {estimated} tokens, limit {limit}")]
     ContextWindowExceeded { estimated: usize, limit: usize },
 
+    #[error("context compactor exceeded its budget: estimated {estimated} tokens, limit {limit}")]
+    ContextCompactorContractViolation { estimated: usize, limit: usize },
+
     #[error("turn not found: {0}")]
     TurnNotFound(String),
 

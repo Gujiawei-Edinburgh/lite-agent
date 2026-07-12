@@ -91,6 +91,10 @@ impl ContextCompactor for ExampleContextCompactor {
                 prompt.push_str(&previous_summary);
                 prompt.push_str("\n\nNew omitted messages:\n");
             }
+            prompt.push_str(&format!(
+                "\nKeep the summary within approximately {} tokens.\n",
+                input.max_summary_tokens
+            ));
             prompt.push_str(&serde_json::to_string(&input.messages)?);
 
             let mut handler = |_event| {};

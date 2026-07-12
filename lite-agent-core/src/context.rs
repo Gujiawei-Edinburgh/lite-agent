@@ -2,9 +2,17 @@ use crate::error::{AgentError, Result};
 use crate::projection::{ChatMessage, ThreadProjection};
 use crate::store::ThreadContextCache;
 use chrono::{Local, Utc};
+use serde_json::Value;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OversizedGroupPolicy {
+    ElideToolOutputs,
+    DropWithMarker,
+    Fail,
+}
 
 pub struct ContextBuildInput<'a> {
     pub thread_id: &'a str,
@@ -53,10 +61,14 @@ pub trait ContextCompactor: Send + Sync {
 pub struct CompactionInput {
     pub messages: Vec<ChatMessage>,
     pub previous_summary: Option<String>,
+    pub max_summary_tokens: usize,
 }
 
 pub struct CompactingContextBuilder {
     pub max_context_tokens: usize,
+    /// Budget reserved for a generated summary when a compactor is configured.
+    pub summary_budget_tokens: usize,
+    pub oversized_group_policy: OversizedGroupPolicy,
     pub policy_version: String,
     pub estimator: Arc<dyn TokenEstimator>,
     pub compactor: Option<Arc<dyn ContextCompactor>>,
@@ -66,6 +78,8 @@ impl Default for CompactingContextBuilder {
     fn default() -> Self {
         Self {
             max_context_tokens: 32_000,
+            summary_budget_tokens: 1_024,
+            oversized_group_policy: OversizedGroupPolicy::ElideToolOutputs,
             policy_version: "compacting-v1".to_string(),
             estimator: Arc::new(ApproximateTokenEstimator),
             compactor: None,
@@ -79,6 +93,16 @@ impl CompactingContextBuilder {
         C: ContextCompactor + 'static,
     {
         self.compactor = Some(Arc::new(compactor));
+        self
+    }
+
+    pub fn with_summary_budget_tokens(mut self, tokens: usize) -> Self {
+        self.summary_budget_tokens = tokens;
+        self
+    }
+
+    pub fn with_oversized_group_policy(mut self, policy: OversizedGroupPolicy) -> Self {
+        self.oversized_group_policy = policy;
         self
     }
 }
@@ -124,30 +148,51 @@ impl ContextBuilder for CompactingContextBuilder {
                 });
             }
             let budget = self.max_context_tokens - system_tokens;
+            let reserved_summary_budget = self
+                .compactor
+                .as_ref()
+                .map(|_| self.summary_budget_tokens.min(budget))
+                .unwrap_or(0);
+            let history_budget = budget.saturating_sub(reserved_summary_budget);
             let groups = tool_call_blocks(&input.projection.conversation);
             let mut selected = Vec::new();
             let mut selected_tokens: usize = 0;
-            let mut first_omitted_group = None;
+            let mut omitted_group_end = 0;
 
             for (index, group) in groups.iter().enumerate().rev() {
                 let group_tokens = self.estimator.estimate(group);
-                if selected.is_empty() && group_tokens > budget {
-                    return Err(AgentError::ContextWindowExceeded {
-                        estimated: group_tokens + system_tokens,
-                        limit: self.max_context_tokens,
-                    });
-                }
-                if selected_tokens.saturating_add(group_tokens) > budget {
-                    first_omitted_group = Some(index);
+                let selection_budget = if selected.is_empty() {
+                    // The newest block gets the full budget. Older blocks use the
+                    // summary reservation so the current interaction can advance.
+                    budget
+                } else {
+                    history_budget
+                };
+                if selected_tokens.saturating_add(group_tokens) > selection_budget {
+                    if selected.is_empty() {
+                        let reduced = fit_oversized_group(
+                            group,
+                            budget,
+                            self.oversized_group_policy,
+                            &*self.estimator,
+                        )?;
+                        selected_tokens = self.estimator.estimate(&reduced);
+                        selected = reduced;
+                        omitted_group_end = index;
+                    } else {
+                        omitted_group_end = index + 1;
+                    }
                     break;
                 }
                 selected.splice(0..0, group.iter().cloned());
                 selected_tokens = selected_tokens.saturating_add(group_tokens);
             }
 
-            let omitted: Vec<ChatMessage> = first_omitted_group
-                .map(|index| groups[..=index].iter().flatten().cloned().collect())
-                .unwrap_or_default();
+            let omitted: Vec<ChatMessage> = groups[..omitted_group_end]
+                .iter()
+                .flatten()
+                .cloned()
+                .collect();
             let cache_is_current = input.cached_context.is_some_and(|cache| {
                 cache.source_version == input.thread_version
                     && cache.policy_version == self.policy_version
@@ -173,6 +218,7 @@ impl ContextBuilder for CompactingContextBuilder {
                         .compact(CompactionInput {
                             messages: omitted[start..].to_vec(),
                             previous_summary,
+                            max_summary_tokens: reserved_summary_budget,
                         })
                         .await?,
                 )
@@ -180,29 +226,48 @@ impl ContextBuilder for CompactingContextBuilder {
                 None
             };
 
+            let summary_message = summary
+                .map(|summary| {
+                    let summary_message = ChatMessage::System {
+                        content: summary.clone(),
+                    };
+                    let summary_tokens = self
+                        .estimator
+                        .estimate(std::slice::from_ref(&summary_message));
+                    if summary_tokens > reserved_summary_budget {
+                        return Err(AgentError::ContextCompactorContractViolation {
+                            estimated: summary_tokens,
+                            limit: reserved_summary_budget,
+                        });
+                    }
+                    if selected_tokens.saturating_add(summary_tokens) > budget {
+                        return Err(AgentError::ContextWindowExceeded {
+                            estimated: system_tokens
+                                .saturating_add(selected_tokens)
+                                .saturating_add(summary_tokens),
+                            limit: self.max_context_tokens,
+                        });
+                    }
+                    Ok(summary_message)
+                })
+                .transpose()?;
+
             let mut messages = vec![system];
-            if let Some(summary) = &summary {
-                let summary_message = ChatMessage::System {
-                    content: summary.clone(),
-                };
-                let summary_tokens = self
-                    .estimator
-                    .estimate(std::slice::from_ref(&summary_message));
-                if selected_tokens.saturating_add(summary_tokens) <= budget {
-                    messages.push(summary_message);
-                }
+            if let Some(summary_message) = &summary_message {
+                messages.push(summary_message.clone());
             }
             messages.extend(selected);
-            Ok(ContextBuildOutput {
-                messages,
-                cache: summary.map(|summary| ThreadContextCache {
+            let cache = summary_message.and_then(|message| match message {
+                ChatMessage::System { content } => Some(ThreadContextCache {
                     thread_id: input.thread_id.to_string(),
                     source_version: input.thread_version,
                     policy_version: self.policy_version.clone(),
                     covered_message_count: omitted.len(),
-                    summary,
+                    summary: content,
                 }),
-            })
+                _ => None,
+            });
+            Ok(ContextBuildOutput { messages, cache })
         })
     }
 }
@@ -225,6 +290,55 @@ fn tool_call_blocks(messages: &[ChatMessage]) -> Vec<Vec<ChatMessage>> {
         groups.push(group);
     }
     groups
+}
+
+fn fit_oversized_group(
+    group: &[ChatMessage],
+    budget: usize,
+    policy: OversizedGroupPolicy,
+    estimator: &dyn TokenEstimator,
+) -> Result<Vec<ChatMessage>> {
+    match policy {
+        OversizedGroupPolicy::Fail => Err(AgentError::ContextWindowExceeded {
+            estimated: estimator.estimate(group),
+            limit: budget,
+        }),
+        OversizedGroupPolicy::DropWithMarker => Ok(context_truncation_marker(estimator, budget)),
+        OversizedGroupPolicy::ElideToolOutputs => {
+            let reduced = group
+                .iter()
+                .map(|message| match message {
+                    ChatMessage::Tool {
+                        tool_call_id, name, ..
+                    } => ChatMessage::Tool {
+                        tool_call_id: tool_call_id.clone(),
+                        name: name.clone(),
+                        content: Value::String(
+                            "[tool output elided because it exceeded the context budget]"
+                                .to_string(),
+                        ),
+                    },
+                    message => message.clone(),
+                })
+                .collect::<Vec<_>>();
+            if estimator.estimate(&reduced) <= budget {
+                Ok(reduced)
+            } else {
+                Ok(context_truncation_marker(estimator, budget))
+            }
+        }
+    }
+}
+
+fn context_truncation_marker(estimator: &dyn TokenEstimator, budget: usize) -> Vec<ChatMessage> {
+    let marker = ChatMessage::System {
+        content: "[conversation block omitted because it exceeded the context budget]".to_string(),
+    };
+    if estimator.estimate(std::slice::from_ref(&marker)) <= budget {
+        vec![marker]
+    } else {
+        Vec::new()
+    }
 }
 
 #[cfg(test)]
