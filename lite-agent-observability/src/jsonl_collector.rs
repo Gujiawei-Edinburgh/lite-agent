@@ -51,6 +51,15 @@ impl TraceCollector for JsonlTraceCollector {
             return;
         }
 
+        let thread_id = event.thread_id.clone();
+        let raw = match serde_json::to_vec(&event) {
+            Ok(raw) => raw,
+            Err(error) => {
+                tracing::error!(thread_id, error = %error, "failed to serialize trace event");
+                return;
+            }
+        };
+
         let mut files = match self.files.lock() {
             Ok(files) => files,
             Err(error) => {
@@ -58,7 +67,6 @@ impl TraceCollector for JsonlTraceCollector {
                 return;
             }
         };
-        let thread_id = event.thread_id.clone();
         let writer = match files.entry(thread_id.clone()) {
             std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
             std::collections::btree_map::Entry::Vacant(entry) => match self.open_file(&thread_id) {
@@ -70,13 +78,6 @@ impl TraceCollector for JsonlTraceCollector {
             },
         };
 
-        let raw = match serde_json::to_vec(&event) {
-            Ok(raw) => raw,
-            Err(error) => {
-                tracing::error!(thread_id, error = %error, "failed to serialize trace event");
-                return;
-            }
-        };
         if let Err(error) = writer.write_all(&raw).and_then(|_| writer.write_all(b"\n")) {
             tracing::error!(thread_id, error = %error, "failed to write trace event");
         }
