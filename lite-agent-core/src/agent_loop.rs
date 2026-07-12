@@ -420,6 +420,13 @@ impl Agent {
                         text,
                         function_calls,
                     } => {
+                        if text.is_none() && function_calls.is_empty() {
+                            let error = "model returned neither assistant text nor function calls"
+                                .to_string();
+                            tracing::error!(error, "empty model response");
+                            self.fail_turn(&mut thread, &session.active_turn_id, error.clone())?;
+                            break 'turn_loop TurnOutcome::Failed { error };
+                        }
                         if let Some(text) = &text {
                             on_event(TurnStreamEvent::Model(TurnModelEvent::AssistantMessage {
                                 text: text.clone(),
@@ -1084,6 +1091,26 @@ mod tests {
         assert_eq!(thread.turns.len(), 1);
         assert_eq!(thread.turns[0].status, TurnStatus::Completed);
         assert_eq!(thread.turns[0].items.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn empty_model_response_fails_turn() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(JsonFileThreadStore::open(temp.path()).expect("store"));
+        let agent = agent_with(
+            store.clone(),
+            vec![ModelResponse::Assistant {
+                text: None,
+                function_calls: Vec::new(),
+            }],
+        );
+
+        let outcome = agent.run_turn("t", "hello").await.expect("turn");
+        assert!(
+            matches!(outcome, TurnOutcome::Failed { error } if error.contains("neither assistant text nor function calls"))
+        );
+        let thread = store.load("t").await.expect("thread");
+        assert_eq!(thread.turns[0].status, TurnStatus::Failed);
     }
 
     #[tokio::test]

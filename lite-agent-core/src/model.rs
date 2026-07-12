@@ -374,6 +374,12 @@ fn handle_sse_frame(
             continue;
         }
         let event: OpenAiChatStreamResponse = serde_json::from_str(data)?;
+        if let Some(error) = event.error {
+            return Err(AgentError::Model(format!(
+                "streamed provider error: {}",
+                error.message
+            )));
+        }
         if let Some(usage) = event.usage.and_then(OpenAiUsage::into_token_usage) {
             on_event(ModelStreamEvent::TokenUsage { usage });
         }
@@ -400,6 +406,12 @@ struct OpenAiChatStreamResponse {
     #[serde(default)]
     choices: Vec<OpenAiStreamChoice>,
     usage: Option<OpenAiUsage>,
+    error: Option<OpenAiStreamError>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiStreamError {
+    message: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -535,6 +547,19 @@ data: [DONE]
 
         assert_eq!(text, "hello");
         assert_eq!(deltas.len(), 2);
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn rejects_streamed_provider_error_payload() {
+        let mut text = String::new();
+        let mut calls = BTreeMap::<usize, PartialToolCall>::new();
+        let frame = "data: {\"error\":{\"message\":\"provider error\"}}\n\n";
+
+        let error = handle_sse_frame(frame, &mut text, &mut calls, &mut |_event| {})
+            .expect_err("provider error");
+        assert!(error.to_string().contains("provider error"));
+        assert!(text.is_empty());
         assert!(calls.is_empty());
     }
 
