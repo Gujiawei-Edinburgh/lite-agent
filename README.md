@@ -1,6 +1,6 @@
 # Lite Agent
 
-Lite Agent is a Rust library for building Q&A agents with tool-assisted workflows. It gives an application a durable conversation, a streaming agent loop, and clear places to add its own functions and policies.
+Lite Agent is a Rust library for building agents with tool-assisted workflows. It gives an application a durable conversation, a streaming agent loop, and clear places to add its own functions and policies.
 
 It is intentionally business-agnostic. Your application owns the domain knowledge and user experience; Lite Agent coordinates the conversation and records what happened.
 
