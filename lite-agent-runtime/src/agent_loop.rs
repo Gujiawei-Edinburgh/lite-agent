@@ -1,6 +1,6 @@
 use crate::context::{CompactingContextBuilder, ContextBuildInput, ContextBuilder};
 use crate::error::{AgentError, Result};
-use crate::functions::{FunctionContext, FunctionExecution, FunctionRegistry, ThreadUpdate};
+use crate::functions::{FunctionCallExecution, FunctionContext, FunctionRegistry, RuntimeEffect};
 use crate::model::{ModelClient, ModelRequest, ModelResponse, ModelStreamEvent};
 use crate::store::{ThreadContextCache, ThreadStore};
 use crate::trace::{
@@ -572,12 +572,9 @@ impl Agent {
                                 };
                             };
                             match execution {
-                                Ok(FunctionExecution::Completed {
-                                    output,
-                                    thread_update,
-                                }) => {
-                                    let update_item =
-                                        Self::apply_thread_update(&mut thread, thread_update);
+                                Ok(FunctionCallExecution::Completed { output, effects }) => {
+                                    let update_items =
+                                        Self::apply_runtime_effects(&thread, effects);
                                     let hook_result = FunctionCallHookResult::Completed {
                                         output: output.clone(),
                                     };
@@ -588,8 +585,7 @@ impl Agent {
                                             output: output.clone(),
                                         },
                                     };
-                                    let mut func_items =
-                                        update_item.into_iter().collect::<Vec<_>>();
+                                    let mut func_items = update_items;
                                     func_items.push(TurnItem::new(
                                         TurnItemSource::Tool,
                                         TurnItemKind::ToolOutput {
@@ -619,13 +615,13 @@ impl Agent {
                                         TurnStateEvent::FunctionCompleted { call_id, name },
                                     ));
                                 }
-                                Ok(FunctionExecution::Suspended {
+                                Ok(FunctionCallExecution::Suspended {
                                     suspension,
                                     output,
-                                    thread_update,
+                                    effects,
                                 }) => {
-                                    let update_item =
-                                        Self::apply_thread_update(&mut thread, thread_update);
+                                    let update_items =
+                                        Self::apply_runtime_effects(&thread, effects);
                                     let hook_result = FunctionCallHookResult::Suspended {
                                         suspension: suspension.clone(),
                                         output: output.clone(),
@@ -637,8 +633,7 @@ impl Agent {
                                             output: output.clone(),
                                         },
                                     };
-                                    let mut func_items =
-                                        update_item.into_iter().collect::<Vec<_>>();
+                                    let mut func_items = update_items;
                                     func_items.push(TurnItem::new(
                                         TurnItemSource::Tool,
                                         TurnItemKind::ToolOutput {
@@ -958,20 +953,22 @@ impl Agent {
         })
     }
 
-    fn apply_thread_update(thread: &mut Thread, update: Option<ThreadUpdate>) -> Option<TurnItem> {
-        match update {
-            Some(ThreadUpdate::Goal(goal)) => {
-                let previous = thread.goal.replace(goal.clone());
-                Some(TurnItem::new(
-                    TurnItemSource::Runtime,
-                    TurnItemKind::GoalUpdated {
-                        previous,
-                        current: goal,
-                    },
-                ))
-            }
-            None => None,
-        }
+    fn apply_runtime_effects(thread: &Thread, effects: Vec<RuntimeEffect>) -> Vec<TurnItem> {
+        effects
+            .into_iter()
+            .map(|effect| match effect {
+                RuntimeEffect::SetGoal(goal) => {
+                    let previous = ThreadProjection::from_thread(thread).goal;
+                    TurnItem::new(
+                        TurnItemSource::Runtime,
+                        TurnItemKind::GoalUpdated {
+                            previous,
+                            current: goal,
+                        },
+                    )
+                }
+            })
+            .collect()
     }
 
     fn push_turn_items(thread: &mut Thread, turn_id: &str, items: Vec<TurnItem>) -> Result<()> {
@@ -1031,6 +1028,7 @@ mod tests {
         TurnOutcome, TurnStateEvent, TurnStreamEvent,
     };
     use lite_agent_kernel::events::{TokenUsage, ToolResult, TurnItemKind, TurnStatus};
+    use lite_agent_kernel::projection::ThreadProjection;
     use serde_json::json;
     use std::collections::VecDeque;
     use std::future::Future;
@@ -1648,8 +1646,9 @@ mod tests {
             }
         );
         let thread = store.load("t").await.expect("thread");
+        let projection = ThreadProjection::from_thread(&thread);
         assert_eq!(
-            thread.goal.as_ref().map(|goal| goal.objective.as_str()),
+            projection.goal.as_ref().map(|goal| goal.objective.as_str()),
             Some("ship")
         );
         assert!(thread.turns[0]

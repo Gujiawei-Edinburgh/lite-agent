@@ -50,7 +50,6 @@ pub struct ThreadProjection {
 impl ThreadProjection {
     pub fn from_thread(thread: &Thread) -> Self {
         let mut projection = Self {
-            goal: thread.goal.clone(),
             latest_turn_id: thread.turns.last().map(|turn| turn.id.clone()),
             active_turn_id: thread
                 .turns
@@ -149,13 +148,21 @@ mod tests {
     use super::{ChatMessage, ThreadProjection};
 
     #[test]
-    fn copies_thread_goal() {
+    fn derives_thread_goal_from_goal_update() {
         let mut thread = Thread::new("t");
-        thread.goal = Some(GoalState {
-            objective: "ship".to_string(),
-            status: GoalStatus::Active,
-            notes: None,
-        });
+        let mut turn = Turn::new();
+        turn.push_item(TurnItem::new(
+            TurnItemSource::Runtime,
+            TurnItemKind::GoalUpdated {
+                previous: None,
+                current: GoalState {
+                    objective: "ship".to_string(),
+                    status: GoalStatus::Active,
+                    notes: None,
+                },
+            },
+        ));
+        thread.turns.push(turn);
 
         let projection = ThreadProjection::from_thread(&thread);
         assert_eq!(

@@ -294,11 +294,19 @@ mod tests {
 
         let stale = store.load("t1").await.expect("load");
         let mut current = stale.clone();
-        current.goal = Some(GoalState {
-            objective: "first".to_string(),
-            status: GoalStatus::Active,
-            notes: None,
-        });
+        let mut turn = Turn::new();
+        turn.push_item(TurnItem::new(
+            TurnItemSource::Runtime,
+            TurnItemKind::GoalUpdated {
+                previous: None,
+                current: GoalState {
+                    objective: "first".to_string(),
+                    status: GoalStatus::Active,
+                    notes: None,
+                },
+            },
+        ));
+        current.turns.push(turn);
         let committed = store.commit(current, stale.version).await.expect("commit");
         assert_eq!(committed.version, 2);
 

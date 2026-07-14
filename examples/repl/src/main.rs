@@ -179,10 +179,7 @@ fn exec_command_function(
                     .unwrap_or(30_000);
 
                 let output = run_shell_command(&cwd, &cmd, timeout_ms).await?;
-                Ok(FunctionExecution::Completed {
-                    output,
-                    thread_update: None,
-                })
+                Ok(FunctionExecution::Completed { output })
             }
         },
     )

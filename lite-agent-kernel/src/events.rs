@@ -18,7 +18,6 @@ pub struct Thread {
     #[serde(default)]
     pub version: u64,
     pub id: ThreadId,
-    pub goal: Option<GoalState>,
     pub turns: Vec<Turn>,
     #[serde(default)]
     pub token_usage: TokenUsage,
@@ -33,7 +32,6 @@ impl Thread {
             schema_version: current_schema_version(),
             version: 0,
             id: id.into(),
-            goal: None,
             turns: Vec::new(),
             token_usage: TokenUsage::default(),
             created_at: now.clone(),

@@ -17,8 +17,8 @@ pub use context::{
 };
 pub use error::{AgentError, Result};
 pub use functions::{
-    builtin_registry, AgentFunction, FunctionContext, FunctionExecution, FunctionRegistry,
-    SimpleFunction, ThreadUpdate,
+    builtin_registry, AgentFunction, FunctionCallExecution, FunctionContext, FunctionExecution,
+    FunctionRegistry, RuntimeCommand, RuntimeCommandExecution, RuntimeEffect, SimpleFunction,
 };
 pub use model::{
     FunctionSpec, ModelClient, ModelFunctionCall, ModelRequest, ModelResponse, ModelStreamEvent,

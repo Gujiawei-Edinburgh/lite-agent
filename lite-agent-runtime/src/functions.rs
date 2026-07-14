@@ -20,20 +20,44 @@ pub struct FunctionContext {
 }
 
 #[derive(Debug, Clone)]
-pub enum ThreadUpdate {
-    Goal(GoalState),
-}
-
-#[derive(Debug, Clone)]
 pub enum FunctionExecution {
     Completed {
         output: Value,
-        thread_update: Option<ThreadUpdate>,
     },
     Suspended {
         suspension: Suspension,
         output: Value,
-        thread_update: Option<ThreadUpdate>,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub enum RuntimeEffect {
+    SetGoal(GoalState),
+}
+
+#[derive(Debug, Clone)]
+pub enum RuntimeCommandExecution {
+    Completed {
+        output: Value,
+        effects: Vec<RuntimeEffect>,
+    },
+    Suspended {
+        suspension: Suspension,
+        output: Value,
+        effects: Vec<RuntimeEffect>,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub enum FunctionCallExecution {
+    Completed {
+        output: Value,
+        effects: Vec<RuntimeEffect>,
+    },
+    Suspended {
+        suspension: Suspension,
+        output: Value,
+        effects: Vec<RuntimeEffect>,
     },
 }
 
@@ -44,6 +68,15 @@ pub trait AgentFunction: Send + Sync {
         args: Value,
         context: FunctionContext,
     ) -> Pin<Box<dyn Future<Output = Result<FunctionExecution>> + Send + 'a>>;
+}
+
+pub trait RuntimeCommand: Send + Sync {
+    fn spec(&self) -> FunctionSpec;
+    fn call<'a>(
+        &'a self,
+        args: Value,
+        context: FunctionContext,
+    ) -> Pin<Box<dyn Future<Output = Result<RuntimeCommandExecution>> + Send + 'a>>;
 }
 
 pub struct SimpleFunction<F> {
@@ -77,7 +110,13 @@ where
 
 #[derive(Clone, Default)]
 pub struct FunctionRegistry {
-    functions: BTreeMap<String, Arc<dyn AgentFunction>>,
+    functions: BTreeMap<String, RegisteredFunction>,
+}
+
+#[derive(Clone)]
+enum RegisteredFunction {
+    Tool(Arc<dyn AgentFunction>),
+    RuntimeCommand(Arc<dyn RuntimeCommand>),
 }
 
 impl FunctionRegistry {
@@ -89,14 +128,29 @@ impl FunctionRegistry {
     where
         F: AgentFunction + 'static,
     {
-        self.functions
-            .insert(function.spec().name.clone(), Arc::new(function));
+        self.functions.insert(
+            function.spec().name.clone(),
+            RegisteredFunction::Tool(Arc::new(function)),
+        );
+    }
+
+    pub fn register_runtime_command<C>(&mut self, command: C)
+    where
+        C: RuntimeCommand + 'static,
+    {
+        self.functions.insert(
+            command.spec().name.clone(),
+            RegisteredFunction::RuntimeCommand(Arc::new(command)),
+        );
     }
 
     pub fn specs(&self) -> Vec<FunctionSpec> {
         self.functions
             .values()
-            .map(|function| function.spec())
+            .map(|function| match function {
+                RegisteredFunction::Tool(function) => function.spec(),
+                RegisteredFunction::RuntimeCommand(command) => command.spec(),
+            })
             .collect()
     }
 
@@ -105,26 +159,56 @@ impl FunctionRegistry {
         name: &str,
         args: Value,
         context: FunctionContext,
-    ) -> Result<FunctionExecution> {
+    ) -> Result<FunctionCallExecution> {
         let function = self
             .functions
             .get(name)
             .ok_or_else(|| AgentError::FunctionNotFound(name.to_string()))?;
-        function.call(args, context).await
+        match function {
+            RegisteredFunction::Tool(function) => match function.call(args, context).await? {
+                FunctionExecution::Completed { output } => Ok(FunctionCallExecution::Completed {
+                    output,
+                    effects: Vec::new(),
+                }),
+                FunctionExecution::Suspended { suspension, output } => {
+                    Ok(FunctionCallExecution::Suspended {
+                        suspension,
+                        output,
+                        effects: Vec::new(),
+                    })
+                }
+            },
+            RegisteredFunction::RuntimeCommand(command) => {
+                match command.call(args, context).await? {
+                    RuntimeCommandExecution::Completed { output, effects } => {
+                        Ok(FunctionCallExecution::Completed { output, effects })
+                    }
+                    RuntimeCommandExecution::Suspended {
+                        suspension,
+                        output,
+                        effects,
+                    } => Ok(FunctionCallExecution::Suspended {
+                        suspension,
+                        output,
+                        effects,
+                    }),
+                }
+            }
+        }
     }
 }
 
 pub fn builtin_registry() -> FunctionRegistry {
     let mut registry = FunctionRegistry::new();
-    registry.register(GetGoal);
-    registry.register(UpdateGoal);
-    registry.register(AskUser);
+    registry.register_runtime_command(GetGoal);
+    registry.register_runtime_command(UpdateGoal);
+    registry.register_runtime_command(AskUser);
     registry
 }
 
 struct GetGoal;
 
-impl AgentFunction for GetGoal {
+impl RuntimeCommand for GetGoal {
     fn spec(&self) -> FunctionSpec {
         FunctionSpec {
             name: "get_goal".to_string(),
@@ -141,11 +225,11 @@ impl AgentFunction for GetGoal {
         &'a self,
         _args: Value,
         context: FunctionContext,
-    ) -> Pin<Box<dyn Future<Output = Result<FunctionExecution>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<RuntimeCommandExecution>> + Send + 'a>> {
         Box::pin(async move {
-            Ok(FunctionExecution::Completed {
+            Ok(RuntimeCommandExecution::Completed {
                 output: json!({ "goal": context.projection.goal }),
-                thread_update: None,
+                effects: Vec::new(),
             })
         })
     }
@@ -160,7 +244,7 @@ struct UpdateGoalArgs {
     notes: Option<String>,
 }
 
-impl AgentFunction for UpdateGoal {
+impl RuntimeCommand for UpdateGoal {
     fn spec(&self) -> FunctionSpec {
         FunctionSpec {
             name: "update_goal".to_string(),
@@ -185,7 +269,7 @@ impl AgentFunction for UpdateGoal {
         &'a self,
         args: Value,
         _context: FunctionContext,
-    ) -> Pin<Box<dyn Future<Output = Result<FunctionExecution>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<RuntimeCommandExecution>> + Send + 'a>> {
         Box::pin(async move {
             let parsed: UpdateGoalArgs = serde_json::from_value(args).map_err(|error| {
                 AgentError::InvalidFunctionArguments {
@@ -198,9 +282,9 @@ impl AgentFunction for UpdateGoal {
                 status: parsed.status,
                 notes: parsed.notes,
             };
-            Ok(FunctionExecution::Completed {
+            Ok(RuntimeCommandExecution::Completed {
                 output: json!({ "goal": current }),
-                thread_update: Some(ThreadUpdate::Goal(current)),
+                effects: vec![RuntimeEffect::SetGoal(current)],
             })
         })
     }
@@ -213,7 +297,7 @@ struct AskUserArgs {
     prompt: String,
 }
 
-impl AgentFunction for AskUser {
+impl RuntimeCommand for AskUser {
     fn spec(&self) -> FunctionSpec {
         FunctionSpec {
             name: "ask_user".to_string(),
@@ -233,7 +317,7 @@ impl AgentFunction for AskUser {
         &'a self,
         args: Value,
         _context: FunctionContext,
-    ) -> Pin<Box<dyn Future<Output = Result<FunctionExecution>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<RuntimeCommandExecution>> + Send + 'a>> {
         Box::pin(async move {
             let parsed: AskUserArgs = serde_json::from_value(args).map_err(|error| {
                 AgentError::InvalidFunctionArguments {
@@ -242,7 +326,7 @@ impl AgentFunction for AskUser {
                 }
             })?;
             let request_id = new_id("req");
-            Ok(FunctionExecution::Suspended {
+            Ok(RuntimeCommandExecution::Suspended {
                 suspension: Suspension {
                     id: request_id.clone(),
                     kind: SuspensionKind::UserInput,
@@ -253,7 +337,7 @@ impl AgentFunction for AskUser {
                     "prompt": parsed.prompt,
                     "status": "suspended"
                 }),
-                thread_update: None,
+                effects: Vec::new(),
             })
         })
     }
@@ -264,11 +348,11 @@ mod tests {
     use lite_agent_kernel::events::{GoalStatus, SuspensionKind, Thread};
     use lite_agent_kernel::projection::ThreadProjection;
 
-    use super::{builtin_registry, FunctionContext, FunctionExecution, ThreadUpdate};
+    use super::{builtin_registry, FunctionCallExecution, FunctionContext};
     use serde_json::json;
 
     #[tokio::test]
-    async fn update_goal_returns_thread_update_and_item() {
+    async fn update_goal_returns_runtime_effect() {
         let registry = builtin_registry();
         let execution = registry
             .call(
@@ -285,12 +369,12 @@ mod tests {
             .await
             .expect("call");
 
-        let FunctionExecution::Completed { thread_update, .. } = execution else {
+        let FunctionCallExecution::Completed { effects, .. } = execution else {
             panic!("expected completion");
         };
         assert!(matches!(
-            thread_update,
-            Some(ThreadUpdate::Goal(goal)) if goal.status == GoalStatus::Active
+            effects.as_slice(),
+            [super::RuntimeEffect::SetGoal(goal)] if goal.status == GoalStatus::Active
         ));
     }
 
@@ -312,7 +396,7 @@ mod tests {
             .await
             .expect("call");
 
-        let FunctionExecution::Suspended { suspension, .. } = execution else {
+        let FunctionCallExecution::Suspended { suspension, .. } = execution else {
             panic!("expected waiting");
         };
         assert_eq!(suspension.kind, SuspensionKind::UserInput);
