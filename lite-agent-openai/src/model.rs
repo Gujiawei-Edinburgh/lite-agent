@@ -113,7 +113,8 @@ struct OpenAiChatRequest {
     messages: Vec<OpenAiMessage>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<OpenAiTool>,
-    tool_choice: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<&'static str>,
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream_options: Option<OpenAiStreamOptions>,
@@ -126,6 +127,7 @@ impl OpenAiChatRequest {
         request: ModelRequest,
         stream: bool,
     ) -> Self {
+        let has_tools = !request.functions.is_empty();
         Self {
             model: model.to_string(),
             reasoning_effort: reasoning_effort.to_string(),
@@ -142,7 +144,7 @@ impl OpenAiChatRequest {
                     function,
                 })
                 .collect(),
-            tool_choice: "auto",
+            tool_choice: has_tools.then_some("auto"),
             stream,
             stream_options: stream.then_some(OpenAiStreamOptions {
                 include_usage: true,
@@ -483,6 +485,22 @@ mod tests {
         assert_eq!(messages[1]["tool_call_id"], "call_1");
         assert_eq!(messages[1]["name"], Value::Null);
         assert_ne!(messages[1]["content"], Value::Null);
+    }
+
+    #[test]
+    fn omits_tools_and_tool_choice_for_tool_free_requests() {
+        let request = ModelRequest {
+            messages: vec![ChatMessage::User {
+                content: "judge this".to_string(),
+            }],
+            functions: Vec::new(),
+        };
+
+        let body = OpenAiChatRequest::from_model_request("model", "medium", request, true);
+        let value = serde_json::to_value(body).expect("json");
+
+        assert!(value.get("tools").is_none());
+        assert!(value.get("tool_choice").is_none());
     }
 
     #[tokio::test]
