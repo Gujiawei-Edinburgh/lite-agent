@@ -111,6 +111,7 @@ struct OpenAiChatRequest {
     model: String,
     reasoning_effort: String,
     messages: Vec<OpenAiMessage>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<OpenAiTool>,
     tool_choice: &'static str,
     stream: bool,
