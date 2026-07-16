@@ -57,6 +57,12 @@ async fn main() -> Result<()> {
         model: args.model,
         reasoning_effort: args.reasoning_effort,
     }));
+    let context_builder = CompactingContextBuilder {
+        max_context_tokens: 128 * 1024,
+        ..CompactingContextBuilder::default()
+    }.with_compactor(ExampleContextCompactor {
+            model: model_client.clone(),
+    });
     let agent = Agent::new(
         AgentConfig::default(),
         store.clone(),
@@ -64,11 +70,7 @@ async fn main() -> Result<()> {
         example_registry(args.command_cwd),
     )
     .with_shared_trace_collector(trace_collector.clone())
-    .with_context_builder(CompactingContextBuilder::default().with_compactor(
-        ExampleContextCompactor {
-            model: model_client,
-        },
-    ));
+    .with_context_builder(context_builder);
 
     let result = run_repl(agent, store, thread_id).await;
     trace_collector.flush().await;
