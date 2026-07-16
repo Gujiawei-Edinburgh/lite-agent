@@ -17,21 +17,10 @@ use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::watch;
 
-pub trait RuntimeContextProvider: Send + Sync {
-    fn context_for_turn(&self, input: RuntimeContextInput<'_>) -> Option<String>;
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct RuntimeContextInput<'a> {
-    pub thread_id: &'a str,
-    pub user_text: &'a str,
-}
-
 #[derive(Clone)]
 pub struct AgentConfig {
     pub max_model_iterations: usize,
     pub system_prompt: String,
-    pub runtime_context_provider: Option<Arc<dyn RuntimeContextProvider>>,
 }
 
 impl std::fmt::Debug for AgentConfig {
@@ -39,10 +28,6 @@ impl std::fmt::Debug for AgentConfig {
         f.debug_struct("AgentConfig")
             .field("max_model_iterations", &self.max_model_iterations)
             .field("system_prompt", &self.system_prompt)
-            .field(
-                "runtime_context_provider",
-                &self.runtime_context_provider.is_some(),
-            )
             .finish()
     }
 }
@@ -57,7 +42,6 @@ impl Default for AgentConfig {
                 "Ask the user when required information is missing."
             )
             .to_string(),
-            runtime_context_provider: None,
         }
     }
 }
@@ -329,17 +313,6 @@ impl Agent {
 
         let user_text = user_text.into();
         let trace_user_text = user_text.clone();
-        let runtime_context = self
-            .config
-            .runtime_context_provider
-            .as_ref()
-            .and_then(|provider| {
-                provider.context_for_turn(RuntimeContextInput {
-                    thread_id,
-                    user_text: &user_text,
-                })
-            });
-
         let mut thread = match self.store.load(thread_id).await {
             Ok(thread) => thread,
             Err(AgentError::ThreadNotFound(_)) => Thread::new(thread_id),
@@ -386,7 +359,6 @@ impl Agent {
                         thread_id,
                         thread.version,
                         session.projection.clone(),
-                        runtime_context.as_deref(),
                         cached_context.as_ref(),
                     )
                     .await?;
@@ -930,7 +902,6 @@ impl Agent {
         thread_id: &str,
         thread_version: u64,
         projection: ThreadProjection,
-        runtime_context: Option<&str>,
         cached_context: Option<&ThreadContextCache>,
     ) -> Result<ModelRequest> {
         let context = self
@@ -940,7 +911,6 @@ impl Agent {
                 thread_version,
                 projection: &projection,
                 system_prompt: &self.config.system_prompt,
-                runtime_context,
                 cached_context,
             })
             .await?;
@@ -1024,8 +994,7 @@ mod tests {
     use crate::store::{SessionLock, ThreadContextCache, ThreadStore};
     use crate::{
         turn_abort_pair, Agent, AgentConfig, AgentError, FunctionCallHook, FunctionCallHookContext,
-        FunctionCallHookResult, Result, RuntimeContextInput, RuntimeContextProvider, RuntimeEvent,
-        TurnOutcome, TurnStateEvent, TurnStreamEvent,
+        FunctionCallHookResult, Result, RuntimeEvent, TurnOutcome, TurnStateEvent, TurnStreamEvent,
     };
     use lite_agent_kernel::events::{TokenUsage, ToolResult, TurnItemKind, TurnStatus};
     use lite_agent_kernel::projection::ThreadProjection;
@@ -1431,82 +1400,6 @@ mod tests {
             event,
             TurnStreamEvent::State(TurnStateEvent::TurnAborted { .. })
         )));
-    }
-
-    #[tokio::test]
-    async fn model_request_includes_current_time_context() {
-        let store = Arc::new(TestStore::default());
-        let agent = agent_with(
-            store,
-            vec![ModelResponse::AssistantMessage {
-                text: "hello".to_string(),
-            }],
-        );
-
-        let request = agent
-            .model_request_from_projection("t", 0, Default::default(), None, None)
-            .await
-            .expect("context");
-        let Some(lite_agent_kernel::projection::ChatMessage::System { content }) =
-            request.messages.first()
-        else {
-            panic!("missing system message");
-        };
-
-        assert!(content.contains("Current time context: local="));
-        assert!(content.contains("utc="));
-        assert!(content.contains("time-sensitive answers"));
-    }
-
-    #[tokio::test]
-    async fn runtime_context_is_added_to_system_prompt_not_user_input() {
-        struct DummyRuntimeContextProvider;
-
-        impl RuntimeContextProvider for DummyRuntimeContextProvider {
-            fn context_for_turn(&self, input: RuntimeContextInput<'_>) -> Option<String> {
-                Some(format!(
-                    "<runtime thread=\"{}\">query={}</runtime>",
-                    input.thread_id, input.user_text
-                ))
-            }
-        }
-
-        let store = Arc::new(TestStore::default());
-        let model = Arc::new(MockModel::new(vec![ModelResponse::AssistantMessage {
-            text: "hello".to_string(),
-        }]));
-        let agent = Agent::new(
-            AgentConfig {
-                runtime_context_provider: Some(Arc::new(DummyRuntimeContextProvider)),
-                ..AgentConfig::default()
-            },
-            store.clone(),
-            model.clone(),
-            builtin_registry(),
-        );
-
-        let outcome = agent.run_turn("thread-a", "coffee shop lights").await;
-        assert!(matches!(outcome, Ok(TurnOutcome::AssistantMessage { .. })));
-
-        let system = {
-            let requests = model.requests.lock().expect("requests");
-            requests[0]
-                .messages
-                .iter()
-                .find_map(|message| match message {
-                    lite_agent_kernel::projection::ChatMessage::System { content } => Some(content),
-                    _ => None,
-                })
-                .expect("system message")
-                .clone()
-        };
-        assert!(system.contains("<runtime thread=\"thread-a\">query=coffee shop lights</runtime>"));
-
-        let thread = store.load("thread-a").await.expect("thread");
-        let TurnItemKind::UserInput { text, .. } = &thread.turns[0].items[0].kind else {
-            panic!("missing user input");
-        };
-        assert_eq!(text, "coffee shop lights");
     }
 
     #[tokio::test]

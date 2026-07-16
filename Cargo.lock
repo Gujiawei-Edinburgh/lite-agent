@@ -789,6 +789,7 @@ dependencies = [
  "lite-agent-openai",
  "lite-agent-runtime",
  "lite-agent-store-json",
+ "lite-agent-tools",
  "rustyline",
  "serde_json",
  "tokio",
@@ -798,7 +799,6 @@ dependencies = [
 name = "lite-agent-runtime"
 version = "0.1.0"
 dependencies = [
- "chrono",
  "lite-agent-kernel",
  "serde",
  "serde_json",
@@ -817,6 +817,17 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "lite-agent-tools"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "lite-agent-kernel",
+ "lite-agent-runtime",
+ "serde_json",
  "tokio",
 ]
 

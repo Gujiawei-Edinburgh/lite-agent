@@ -1,6 +1,5 @@
 use crate::error::{AgentError, Result};
 use crate::store::ThreadContextCache;
-use chrono::{Local, Utc};
 use lite_agent_kernel::projection::{ChatMessage, ThreadProjection};
 use serde_json::Value;
 use std::future::Future;
@@ -19,7 +18,6 @@ pub struct ContextBuildInput<'a> {
     pub thread_version: u64,
     pub projection: &'a ThreadProjection,
     pub system_prompt: &'a str,
-    pub runtime_context: Option<&'a str>,
     pub cached_context: Option<&'a ThreadContextCache>,
 }
 
@@ -114,20 +112,6 @@ impl ContextBuilder for CompactingContextBuilder {
     ) -> Pin<Box<dyn Future<Output = Result<ContextBuildOutput>> + Send + 'a>> {
         Box::pin(async move {
             let mut system_content = input.system_prompt.to_string();
-            if let Some(runtime_context) = input.runtime_context {
-                let runtime_context = runtime_context.trim();
-                if !runtime_context.is_empty() {
-                    system_content.push_str(
-                    "\nCurrent turn runtime context. This host-supplied context applies only to this model request and is not durable thread state:\n",
-                );
-                    system_content.push_str(runtime_context);
-                }
-            }
-            system_content.push_str(&format!(
-            "\nCurrent time context: local={}, utc={}. Use this as the current date/time for time-sensitive answers.",
-            Local::now().format("%Y-%m-%d %H:%M:%S %:z"),
-            Utc::now().format("%Y-%m-%d %H:%M:%S UTC")
-        ));
             if let Some(goal) = &input.projection.goal {
                 system_content.push_str(&format!(
                     "\nCurrent thread goal: objective={}, status={:?}, notes={}",
@@ -391,7 +375,6 @@ mod tests {
                 thread_id: "t",
                 thread_version: 1,
                 system_prompt: "system",
-                runtime_context: None,
                 cached_context: None,
             })
             .await
@@ -420,7 +403,6 @@ mod tests {
                 thread_id: "t",
                 thread_version: 1,
                 system_prompt: "system",
-                runtime_context: None,
                 cached_context: None,
             })
             .await

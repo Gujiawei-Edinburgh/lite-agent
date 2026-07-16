@@ -8,8 +8,8 @@ pub mod trace;
 
 pub use agent_loop::{
     turn_abort_pair, Agent, AgentConfig, FunctionCallHook, FunctionCallHookContext,
-    FunctionCallHookResult, RuntimeContextInput, RuntimeContextProvider, RuntimeEvent,
-    TurnAbortHandle, TurnAbortSignal, TurnModelEvent, TurnOutcome, TurnStateEvent, TurnStreamEvent,
+    FunctionCallHookResult, RuntimeEvent, TurnAbortHandle, TurnAbortSignal, TurnModelEvent,
+    TurnOutcome, TurnStateEvent, TurnStreamEvent,
 };
 pub use context::{
     ApproximateTokenEstimator, CompactingContextBuilder, CompactionInput, ContextBuildInput,

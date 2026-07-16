@@ -9,6 +9,7 @@ use lite_agent_runtime::{
     ThreadStore, TraceCollector, TurnModelEvent, TurnOutcome, TurnStateEvent, TurnStreamEvent,
 };
 use lite_agent_store_json::JsonFileThreadStore;
+use lite_agent_tools::register_time_tools;
 use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
 use serde_json::json;
@@ -76,6 +77,7 @@ async fn main() -> Result<()> {
 
 fn example_registry(command_cwd: PathBuf) -> FunctionRegistry {
     let mut registry = builtin_registry();
+    register_time_tools(&mut registry);
     registry.register(exec_command_function(command_cwd));
     registry
 }

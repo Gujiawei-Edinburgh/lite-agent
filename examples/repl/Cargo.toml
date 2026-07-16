@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 lite-agent-kernel = { path = "../../lite-agent-kernel" }
 lite-agent-runtime = { path = "../../lite-agent-runtime" }
+lite-agent-tools = { path = "../../lite-agent-tools" }
 lite-agent-openai = { path = "../../lite-agent-openai" }
 lite-agent-store-json = { path = "../../lite-agent-store-json" }
 lite-agent-observability = { path = "../../lite-agent-observability" }
