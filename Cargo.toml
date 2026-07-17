@@ -3,6 +3,7 @@ members = [
     "lite-agent-kernel",
     "lite-agent-runtime",
     "lite-agent-tools",
+    "lite-agent-tools-native",
     "lite-agent-openai",
     "lite-agent-store-json",
     "lite-agent-observability",

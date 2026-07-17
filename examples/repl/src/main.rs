@@ -60,8 +60,9 @@ async fn main() -> Result<()> {
     let context_builder = CompactingContextBuilder {
         max_context_tokens: 128 * 1024,
         ..CompactingContextBuilder::default()
-    }.with_compactor(ExampleContextCompactor {
-            model: model_client.clone(),
+    }
+    .with_compactor(ExampleContextCompactor {
+        model: model_client.clone(),
     });
     let agent = Agent::new(
         AgentConfig::default(),
