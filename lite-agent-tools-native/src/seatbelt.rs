@@ -35,6 +35,12 @@ impl MacOsSeatbeltBackend {
         }
     }
 
+    pub fn with_sandbox_exec(path: impl Into<PathBuf>) -> Self {
+        Self {
+            sandbox_exec: path.into(),
+        }
+    }
+
     pub fn profile_for(policy: &EffectiveSandboxPolicy) -> SandboxResult<String> {
         render_profile(policy)
     }
@@ -91,8 +97,21 @@ impl MacOsSeatbeltBackend {
     async fn execute_request(&self, request: SandboxRequest) -> SandboxResult<SandboxOutput> {
         request.validate()?;
         let resolution = self.resolve_policy(&request.policy)?;
-        let profile = Self::profile_for(&resolution.effective)?;
         let started = Instant::now();
+
+        if request.cancellation.is_cancelled() {
+            return Ok(SandboxOutput {
+                status: SandboxStatus::Cancelled,
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+                warnings: resolution.warnings,
+                stdout_truncated: false,
+                stderr_truncated: false,
+                duration: started.elapsed(),
+            });
+        }
+
+        let profile = Self::profile_for(&resolution.effective)?;
 
         if !cfg!(target_os = "macos") {
             return Err(SandboxError::UnsupportedPolicy(
@@ -460,5 +479,26 @@ mod tests {
             "unexpected sandbox status: {:?}",
             output.status
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn cancelled_request_does_not_spawn_sandbox() {
+        let cancellation = crate::CancellationToken::default();
+        cancellation.cancel();
+        let request = SandboxRequest {
+            program: PathBuf::from("/bin/true"),
+            args: Vec::new(),
+            cwd: PathBuf::from("/tmp"),
+            environment: BTreeMap::new(),
+            cancellation,
+            policy: SandboxPolicy::workspace_read_write("/tmp"),
+        };
+
+        let output = MacOsSeatbeltBackend::with_sandbox_exec("/path/that/must/not/be_spawned")
+            .execute(request)
+            .await
+            .expect("pre-cancelled request");
+        assert_eq!(output.status, SandboxStatus::Cancelled);
     }
 }
