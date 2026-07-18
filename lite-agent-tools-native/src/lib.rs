@@ -36,11 +36,12 @@ pub enum SandboxError {
 pub trait SandboxBackend: Send + Sync {
     fn name(&self) -> &str;
 
-    /// Check whether this backend can honor the requested guarantees.
+    /// Resolve the requested guarantees into the policy this backend can
+    /// actually enforce.
     ///
-    /// Backends must reject unsupported restrictions instead of silently
-    /// running the command with weaker isolation.
-    fn check_policy(&self, policy: &SandboxPolicy) -> SandboxResult<()>;
+    /// The returned warnings must describe every requested guarantee that was
+    /// weakened or changed by fallback.
+    fn resolve_policy(&self, policy: &SandboxPolicy) -> SandboxResult<SandboxPolicyResolution>;
 
     fn execute<'a>(
         &'a self,
@@ -98,49 +99,118 @@ impl SandboxRequest {
 /// Semantic isolation requirements for one command execution.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SandboxPolicy {
-    pub filesystem: FilesystemPolicy,
-    pub network: NetworkAccess,
-    pub process: ProcessPolicy,
-    pub identity: IdentityIsolation,
+    pub filesystem: PolicySetting<FilesystemPolicy>,
+    pub network: PolicySetting<NetworkAccess>,
+    pub process: PolicySetting<ProcessPolicy>,
+    pub identity: PolicySetting<IdentityIsolation>,
 }
 
 impl SandboxPolicy {
     pub fn workspace_read_only(host_path: impl Into<PathBuf>) -> Self {
         Self {
-            filesystem: FilesystemPolicy::workspace(host_path, FilesystemAccess::ReadOnly),
+            filesystem: PolicySetting::strict(FilesystemPolicy::workspace(
+                host_path,
+                FilesystemAccess::ReadOnly,
+            )),
             ..Self::default()
         }
     }
 
     pub fn workspace_read_write(host_path: impl Into<PathBuf>) -> Self {
         Self {
-            filesystem: FilesystemPolicy::workspace(host_path, FilesystemAccess::ReadWrite),
+            filesystem: PolicySetting::strict(FilesystemPolicy::workspace(
+                host_path,
+                FilesystemAccess::ReadWrite,
+            )),
             ..Self::default()
         }
     }
 
     pub fn workspace_read_write_with_host_network(host_path: impl Into<PathBuf>) -> Self {
         Self {
-            filesystem: FilesystemPolicy::workspace(host_path, FilesystemAccess::ReadWrite),
-            network: NetworkAccess::Host,
+            filesystem: PolicySetting::strict(FilesystemPolicy::workspace(
+                host_path,
+                FilesystemAccess::ReadWrite,
+            )),
+            network: PolicySetting::strict(NetworkAccess::Host),
             ..Self::default()
         }
     }
 
     pub fn validate(&self) -> SandboxResult<()> {
-        self.filesystem.validate()
+        self.filesystem.requested.validate()
     }
 }
 
 impl Default for SandboxPolicy {
     fn default() -> Self {
         Self {
-            filesystem: FilesystemPolicy::default(),
-            network: NetworkAccess::Isolated,
-            process: ProcessPolicy::default(),
-            identity: IdentityIsolation::Unprivileged,
+            filesystem: PolicySetting::strict(FilesystemPolicy::default()),
+            network: PolicySetting::strict(NetworkAccess::Isolated),
+            process: PolicySetting::fallback(ProcessPolicy::default()),
+            identity: PolicySetting::fallback(IdentityIsolation::Unprivileged),
         }
     }
+}
+
+/// Controls what happens when a backend cannot provide one requested
+/// isolation guarantee.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum UnsupportedPolicyBehavior {
+    #[default]
+    Error,
+    WarnAndFallback,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicySetting<T> {
+    pub requested: T,
+    pub unsupported: UnsupportedPolicyBehavior,
+}
+
+impl<T> PolicySetting<T> {
+    pub fn strict(requested: T) -> Self {
+        Self {
+            requested,
+            unsupported: UnsupportedPolicyBehavior::Error,
+        }
+    }
+
+    pub fn fallback(requested: T) -> Self {
+        Self {
+            requested,
+            unsupported: UnsupportedPolicyBehavior::WarnAndFallback,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SandboxPolicyResolution {
+    pub requested: SandboxPolicy,
+    pub effective: EffectiveSandboxPolicy,
+    pub warnings: Vec<SandboxWarning>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EffectiveSandboxPolicy {
+    pub filesystem: FilesystemPolicy,
+    pub network: NetworkAccess,
+    pub process: ProcessPolicy,
+    pub identity: IdentityIsolation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SandboxPolicyDimension {
+    Filesystem,
+    Network,
+    Process,
+    Identity,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SandboxWarning {
+    pub dimension: SandboxPolicyDimension,
+    pub message: String,
 }
 
 /// Filesystem visibility and write access requested by the command.
@@ -254,6 +324,7 @@ pub struct SandboxOutput {
     pub status: SandboxStatus,
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
+    pub warnings: Vec<SandboxWarning>,
     pub stdout_truncated: bool,
     pub stderr_truncated: bool,
     pub duration: Duration,
