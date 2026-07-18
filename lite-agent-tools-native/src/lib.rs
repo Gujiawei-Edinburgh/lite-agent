@@ -15,6 +15,10 @@ use std::sync::{
 use std::time::Duration;
 use thiserror::Error;
 
+mod seatbelt;
+
+pub use seatbelt::MacOsSeatbeltBackend;
+
 pub type SandboxResult<T> = Result<T, SandboxError>;
 
 #[derive(Debug, Error)]
