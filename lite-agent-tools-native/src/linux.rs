@@ -323,7 +323,7 @@ fn make_root_read_only() -> std::io::Result<()> {
         None,
         Path::new("/"),
         None,
-        libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY | libc::MS_REC,
+        libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY,
         None,
     )
 }
@@ -346,15 +346,12 @@ fn apply_filesystem_rules(policy: &FilesystemPolicy) -> std::io::Result<()> {
             libc::MS_BIND | libc::MS_REC,
             None,
         )?;
-        if rule.access == FilesystemAccess::ReadOnly {
-            mount(
-                None,
-                path.as_path(),
-                None,
-                libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY | libc::MS_REC,
-                None,
-            )?;
-        }
+        let remount_flags = match rule.access {
+            FilesystemAccess::ReadOnly => libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY,
+            FilesystemAccess::ReadWrite => libc::MS_BIND | libc::MS_REMOUNT,
+            FilesystemAccess::Denied => libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY,
+        };
+        mount(None, path.as_path(), None, remount_flags, None)?;
     }
     Ok(())
 }

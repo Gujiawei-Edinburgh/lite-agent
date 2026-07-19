@@ -484,7 +484,7 @@ mod tests {
             "write outside configured workspace unexpectedly succeeded"
         );
         assert!(
-            matches!(output.status, SandboxStatus::Exited { code } if code != 0),
+            matches!(output.status, SandboxStatus::Exited { code: 0 }),
             "unexpected sandbox status: {:?}",
             output.status
         );

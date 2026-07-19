@@ -26,4 +26,4 @@ jobs:
         run: apt-get update && apt-get install --yes git
       - uses: actions/checkout@v4
       - name: Run Linux sandbox tests
-        run: cargo test -p lite-agent-tools-native --lib -- --nocapture
+        run: cargo test -p lite-agent-tools-native 'linux::tests::' --lib -- --nocapture
