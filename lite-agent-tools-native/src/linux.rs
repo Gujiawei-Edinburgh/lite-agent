@@ -244,8 +244,12 @@ fn soften_denied_filesystem(policy: &mut FilesystemPolicy) {
 
 fn setup_linux_sandbox(policy: &EffectiveSandboxPolicy) -> std::io::Result<()> {
     if policy.identity == IdentityIsolation::Unprivileged {
+        // Capture the parent namespace IDs first. After CLONE_NEWUSER, an ID
+        // without a mapping is reported as the overflow ID (usually 65534).
+        let uid = unsafe { libc::getuid() };
+        let gid = unsafe { libc::getgid() };
         unshare(libc::CLONE_NEWUSER).map_err(|error| io_context("create user namespace", error))?;
-        configure_user_mapping()?;
+        configure_user_mapping(uid, gid)?;
     }
 
     if !matches!(policy.filesystem, FilesystemPolicy::Host) {
@@ -272,9 +276,7 @@ fn unshare(flags: libc::c_int) -> std::io::Result<()> {
     }
 }
 
-fn configure_user_mapping() -> std::io::Result<()> {
-    let uid = unsafe { libc::getuid() };
-    let gid = unsafe { libc::getgid() };
+fn configure_user_mapping(uid: libc::uid_t, gid: libc::gid_t) -> std::io::Result<()> {
     let _ = std::fs::write("/proc/self/setgroups", "deny");
     std::fs::write("/proc/self/uid_map", format!("0 {uid} 1\n"))
         .map_err(|error| io_context("write uid mapping", error))?;
@@ -312,6 +314,9 @@ fn make_mounts_private() -> std::io::Result<()> {
 }
 
 fn make_root_read_only() -> std::io::Result<()> {
+    // Mounts inherited from a parent mount namespace are locked when this
+    // process enters a less-privileged user namespace. Create a namespace-
+    // owned bind mount before changing its per-mount read-only flag.
     mount(
         Some(Path::new("/")),
         Path::new("/"),
@@ -454,8 +459,27 @@ fn exit_signal(status: &std::process::ExitStatus) -> Option<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{CancellationToken, FilesystemRule};
     use std::collections::BTreeMap;
     use std::path::PathBuf;
+
+    async fn run_shell(
+        policy: SandboxPolicy,
+        cwd: &std::path::Path,
+        command: impl Into<String>,
+        cancellation: CancellationToken,
+    ) -> SandboxResult<SandboxOutput> {
+        LinuxNativeBackend
+            .execute(SandboxRequest {
+                program: PathBuf::from("/bin/sh"),
+                args: vec!["-c".to_string(), command.into()],
+                cwd: cwd.to_path_buf(),
+                environment: BTreeMap::new(),
+                cancellation,
+                policy,
+            })
+            .await
+    }
 
     #[test]
     fn strict_pid_isolation_is_rejected() {
@@ -507,5 +531,150 @@ mod tests {
             "outside write unexpectedly succeeded"
         );
         assert!(matches!(output.status, SandboxStatus::Exited { code: 0 }));
+    }
+
+    #[tokio::test]
+    async fn rejects_writes_in_read_only_workspace() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let file = workspace.path().join("blocked.txt");
+        let command = format!(
+            "if printf blocked > '{}'; then exit 1; else exit 0; fi",
+            file.display()
+        );
+
+        let output = run_shell(
+            SandboxPolicy::workspace_read_only(workspace.path()),
+            workspace.path(),
+            command,
+            CancellationToken::default(),
+        )
+        .await
+        .expect("sandbox execution");
+
+        assert!(!file.exists(), "read-only workspace accepted a write");
+        assert!(matches!(output.status, SandboxStatus::Exited { code: 0 }));
+    }
+
+    #[tokio::test]
+    async fn filesystem_rules_use_longest_matching_path() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let child = workspace.path().join("child");
+        std::fs::create_dir(&child).expect("child directory");
+
+        let parent_file = workspace.path().join("parent.txt");
+        let child_file = child.join("child.txt");
+        let policy = SandboxPolicy {
+            filesystem: PolicySetting::strict(FilesystemPolicy::Workspace {
+                default_access: FilesystemAccess::ReadOnly,
+                rules: vec![
+                    FilesystemRule {
+                        path: workspace.path().to_path_buf(),
+                        access: FilesystemAccess::ReadWrite,
+                    },
+                    FilesystemRule {
+                        path: child.clone(),
+                        access: FilesystemAccess::ReadOnly,
+                    },
+                ],
+            }),
+            ..SandboxPolicy::default()
+        };
+        let command = format!(
+            "printf parent > '{}'; parent_status=$?; printf child > '{}'; child_status=$?; test $parent_status -eq 0 -a $child_status -ne 0",
+            parent_file.display(),
+            child_file.display()
+        );
+
+        let output = run_shell(
+            policy,
+            workspace.path(),
+            command,
+            CancellationToken::default(),
+        )
+        .await
+        .expect("sandbox execution");
+
+        assert!(parent_file.exists(), "parent read-write rule was ignored");
+        assert!(
+            !child_file.exists(),
+            "more specific read-only rule was ignored"
+        );
+        assert!(matches!(output.status, SandboxStatus::Exited { code: 0 }));
+    }
+
+    #[tokio::test]
+    async fn pre_cancelled_request_does_not_launch() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let file = workspace.path().join("unexpected.txt");
+        let cancellation = CancellationToken::default();
+        cancellation.cancel();
+
+        let output = run_shell(
+            SandboxPolicy::workspace_read_write(workspace.path()),
+            workspace.path(),
+            format!("printf unexpected > '{}'", file.display()),
+            cancellation,
+        )
+        .await
+        .expect("sandbox execution");
+
+        assert!(matches!(output.status, SandboxStatus::Cancelled));
+        assert!(!file.exists(), "pre-cancelled command was launched");
+    }
+
+    #[tokio::test]
+    async fn cancellation_terminates_running_process_group() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let cancellation = CancellationToken::default();
+        let request = SandboxRequest {
+            program: PathBuf::from("/bin/sh"),
+            args: vec!["-c".to_string(), "sleep 30".to_string()],
+            cwd: workspace.path().to_path_buf(),
+            environment: BTreeMap::new(),
+            cancellation: cancellation.clone(),
+            policy: SandboxPolicy::workspace_read_write(workspace.path()),
+        };
+        let task = tokio::spawn(async move { LinuxNativeBackend.execute(request).await });
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        cancellation.cancel();
+        let output = task
+            .await
+            .expect("sandbox task")
+            .expect("sandbox execution");
+
+        assert!(matches!(output.status, SandboxStatus::Cancelled));
+    }
+
+    #[tokio::test]
+    async fn network_policy_selects_host_or_isolated_namespace() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let host_namespace = std::fs::read_link("/proc/self/ns/net").expect("host net namespace");
+        let read_namespace = || "readlink /proc/self/ns/net";
+
+        let isolated = run_shell(
+            SandboxPolicy::workspace_read_write(workspace.path()),
+            workspace.path(),
+            read_namespace(),
+            CancellationToken::default(),
+        )
+        .await
+        .expect("isolated network execution");
+        let host = run_shell(
+            SandboxPolicy::workspace_read_write_with_host_network(workspace.path()),
+            workspace.path(),
+            read_namespace(),
+            CancellationToken::default(),
+        )
+        .await
+        .expect("host network execution");
+
+        assert!(matches!(isolated.status, SandboxStatus::Exited { code: 0 }));
+        assert!(matches!(host.status, SandboxStatus::Exited { code: 0 }));
+        assert_ne!(isolated.stdout, host.stdout);
+        assert_eq!(
+            String::from_utf8_lossy(&host.stdout).trim(),
+            host_namespace.to_string_lossy()
+        );
     }
 }
