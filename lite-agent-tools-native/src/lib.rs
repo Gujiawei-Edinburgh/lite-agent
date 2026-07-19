@@ -19,6 +19,12 @@ mod seatbelt;
 
 pub use seatbelt::MacOsSeatbeltBackend;
 
+#[cfg(target_os = "linux")]
+mod linux;
+
+#[cfg(target_os = "linux")]
+pub use linux::LinuxNativeBackend;
+
 pub type SandboxResult<T> = Result<T, SandboxError>;
 
 #[derive(Debug, Error)]
