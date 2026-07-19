@@ -373,6 +373,7 @@ fn exit_signal(_status: &std::process::ExitStatus) -> Option<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "macos")]
     use std::collections::BTreeMap;
 
     #[test]

@@ -12,7 +12,7 @@ use crate::{
 };
 use std::ffi::CString;
 use std::os::unix::process::CommandExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Instant;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
@@ -441,6 +441,7 @@ fn exit_signal(status: &std::process::ExitStatus) -> Option<i32> {
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+    use std::path::PathBuf;
 
     #[test]
     fn strict_pid_isolation_is_rejected() {
