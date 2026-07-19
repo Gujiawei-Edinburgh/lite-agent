@@ -224,9 +224,13 @@ pub enum FilesystemPolicy {
     /// the command.
     #[default]
     Isolated,
-    /// The host filesystem is visible with the requested workspace roots
-    /// writable or read-only according to each entry.
-    Workspace { roots: Vec<WorkspaceRoot> },
+    /// The host filesystem is visible with hierarchical access rules. The
+    /// longest matching rule wins; paths without a matching rule inherit the
+    /// default access.
+    Workspace {
+        default_access: FilesystemAccess,
+        rules: Vec<FilesystemRule>,
+    },
     /// The command can access the host filesystem without filesystem
     /// isolation. This must be selected explicitly.
     Host,
@@ -235,29 +239,55 @@ pub enum FilesystemPolicy {
 impl FilesystemPolicy {
     pub fn workspace(host_path: impl Into<PathBuf>, access: FilesystemAccess) -> Self {
         Self::Workspace {
-            roots: vec![WorkspaceRoot {
+            default_access: FilesystemAccess::ReadOnly,
+            rules: vec![FilesystemRule {
                 path: host_path.into(),
                 access,
             }],
         }
     }
 
+    /// Resolve the effective access for an absolute path using longest-prefix
+    /// matching on complete path components.
+    pub fn access_for(&self, path: impl AsRef<std::path::Path>) -> SandboxResult<FilesystemAccess> {
+        let path = normalize_absolute_path(path.as_ref())?;
+        match self {
+            Self::Isolated => Ok(FilesystemAccess::Denied),
+            Self::Host => Ok(FilesystemAccess::ReadWrite),
+            Self::Workspace {
+                default_access,
+                rules,
+            } => {
+                self.validate()?;
+                Ok(rules
+                    .iter()
+                    .filter_map(|rule| {
+                        normalize_absolute_path(&rule.path)
+                            .ok()
+                            .filter(|rule_path| path.starts_with(rule_path))
+                            .map(|rule_path| (rule_path.components().count(), rule.access))
+                    })
+                    .max_by_key(|(depth, _)| *depth)
+                    .map(|(_, access)| access)
+                    .unwrap_or(*default_access))
+            }
+        }
+    }
+
     fn validate(&self) -> SandboxResult<()> {
-        let roots = match self {
-            Self::Workspace { roots } => roots,
+        let rules = match self {
+            Self::Workspace { rules, .. } => rules,
             Self::Isolated | Self::Host => return Ok(()),
         };
 
-        for root in roots {
-            if root.path.as_os_str().is_empty() {
-                return Err(SandboxError::InvalidRequest(
-                    "workspace path must not be empty".to_string(),
-                ));
-            }
-            if !root.path.is_absolute() {
-                return Err(SandboxError::InvalidRequest(
-                    "workspace path must be absolute".to_string(),
-                ));
+        let mut normalized_paths = std::collections::BTreeSet::new();
+        for rule in rules {
+            let normalized = normalize_absolute_path(&rule.path)?;
+            if !normalized_paths.insert(normalized.clone()) {
+                return Err(SandboxError::InvalidRequest(format!(
+                    "duplicate filesystem rule: {}",
+                    normalized.display()
+                )));
             }
         }
         Ok(())
@@ -265,15 +295,121 @@ impl FilesystemPolicy {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WorkspaceRoot {
+pub struct FilesystemRule {
     pub path: PathBuf,
     pub access: FilesystemAccess,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FilesystemAccess {
+    Denied,
     ReadOnly,
     ReadWrite,
+}
+
+fn normalize_absolute_path(path: &std::path::Path) -> SandboxResult<PathBuf> {
+    if !path.is_absolute() {
+        return Err(SandboxError::InvalidRequest(
+            "filesystem paths must be absolute".to_string(),
+        ));
+    }
+
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::RootDir => normalized.push(component.as_os_str()),
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if !normalized.pop() {
+                    return Err(SandboxError::InvalidRequest(format!(
+                        "filesystem path escapes its root: {}",
+                        path.display()
+                    )));
+                }
+            }
+            std::path::Component::Normal(value) => normalized.push(value),
+            std::path::Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+        }
+    }
+    Ok(normalized)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FilesystemAccess, FilesystemPolicy, FilesystemRule};
+
+    #[test]
+    fn filesystem_rules_use_longest_matching_path() {
+        let policy = FilesystemPolicy::Workspace {
+            default_access: FilesystemAccess::Denied,
+            rules: vec![
+                FilesystemRule {
+                    path: "/project".into(),
+                    access: FilesystemAccess::ReadWrite,
+                },
+                FilesystemRule {
+                    path: "/project/src".into(),
+                    access: FilesystemAccess::ReadOnly,
+                },
+                FilesystemRule {
+                    path: "/project/src/generated".into(),
+                    access: FilesystemAccess::ReadWrite,
+                },
+            ],
+        };
+
+        assert_eq!(
+            policy.access_for("/project/main.rs").unwrap(),
+            FilesystemAccess::ReadWrite
+        );
+        assert_eq!(
+            policy.access_for("/project/src/main.rs").unwrap(),
+            FilesystemAccess::ReadOnly
+        );
+        assert_eq!(
+            policy.access_for("/project/src/generated/file.rs").unwrap(),
+            FilesystemAccess::ReadWrite
+        );
+        assert_eq!(
+            policy.access_for("/project-other/file").unwrap(),
+            FilesystemAccess::Denied
+        );
+    }
+
+    #[test]
+    fn filesystem_rules_match_path_components_not_string_prefixes() {
+        let policy = FilesystemPolicy::Workspace {
+            default_access: FilesystemAccess::Denied,
+            rules: vec![FilesystemRule {
+                path: "/project/src".into(),
+                access: FilesystemAccess::ReadWrite,
+            }],
+        };
+
+        assert_eq!(
+            policy.access_for("/project/src-old/file").unwrap(),
+            FilesystemAccess::Denied
+        );
+    }
+
+    #[test]
+    fn filesystem_rules_reject_duplicate_normalized_paths() {
+        let policy = FilesystemPolicy::Workspace {
+            default_access: FilesystemAccess::Denied,
+            rules: vec![
+                FilesystemRule {
+                    path: "/project/src".into(),
+                    access: FilesystemAccess::ReadOnly,
+                },
+                FilesystemRule {
+                    path: "/project/./src".into(),
+                    access: FilesystemAccess::ReadWrite,
+                },
+            ],
+        };
+
+        assert!(policy.validate().is_err());
+    }
 }
 
 /// Network visibility requested by the command.

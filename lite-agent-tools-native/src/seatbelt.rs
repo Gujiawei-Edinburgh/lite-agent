@@ -276,15 +276,23 @@ fn render_profile(policy: &EffectiveSandboxPolicy) -> SandboxResult<String> {
 
     match &policy.filesystem {
         FilesystemPolicy::Host => {}
-        FilesystemPolicy::Workspace { roots } => {
+        FilesystemPolicy::Workspace { rules, .. } => {
             profile.push_str("(deny file-write*)\n");
-            for root in roots {
-                if root.access == crate::FilesystemAccess::ReadWrite {
-                    let path = canonical_existing_path(&root.path);
-                    profile.push_str(&format!(
-                        "(allow file-write* (subpath \"{}\"))\n",
-                        escape_profile_path(&path)?
-                    ));
+            let mut rules = rules.clone();
+            rules.sort_by_key(|rule| rule.path.components().count());
+            for rule in rules {
+                let path = canonical_existing_path(&rule.path);
+                let path = escape_profile_path(&path)?;
+                match rule.access {
+                    crate::FilesystemAccess::ReadWrite => profile.push_str(&format!(
+                        "(allow file-write* (subpath \"{path}\"))\n"
+                    )),
+                    crate::FilesystemAccess::ReadOnly => profile.push_str(&format!(
+                        "(deny file-write* (subpath \"{path}\"))\n"
+                    )),
+                    crate::FilesystemAccess::Denied => profile.push_str(&format!(
+                        "(deny file-read* (subpath \"{path}\"))\n(deny file-write* (subpath \"{path}\"))\n"
+                    )),
                 }
             }
         }
