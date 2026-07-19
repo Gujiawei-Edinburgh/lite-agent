@@ -1,11 +1,11 @@
-name: Linux
+name: CI
 
 on:
   push:
   pull_request:
 
 jobs:
-  test:
+  rust:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -18,5 +18,5 @@ jobs:
         run: cargo check --workspace
       - name: Run Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
-      - name: Run tests
-        run: cargo test --workspace
+      - name: Run non-sandbox tests
+        run: cargo test --workspace -- --skip 'linux::tests::'

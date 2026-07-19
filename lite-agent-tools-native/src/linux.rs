@@ -244,19 +244,21 @@ fn soften_denied_filesystem(policy: &mut FilesystemPolicy) {
 
 fn setup_linux_sandbox(policy: &EffectiveSandboxPolicy) -> std::io::Result<()> {
     if policy.identity == IdentityIsolation::Unprivileged {
-        unshare(libc::CLONE_NEWUSER)?;
+        unshare(libc::CLONE_NEWUSER).map_err(|error| io_context("create user namespace", error))?;
         configure_user_mapping()?;
     }
 
     if !matches!(policy.filesystem, FilesystemPolicy::Host) {
-        unshare(libc::CLONE_NEWNS)?;
-        make_mounts_private()?;
-        make_root_read_only()?;
-        apply_filesystem_rules(&policy.filesystem)?;
+        unshare(libc::CLONE_NEWNS).map_err(|error| io_context("create mount namespace", error))?;
+        make_mounts_private().map_err(|error| io_context("make mounts private", error))?;
+        make_root_read_only().map_err(|error| io_context("make root read-only", error))?;
+        apply_filesystem_rules(&policy.filesystem)
+            .map_err(|error| io_context("apply filesystem rules", error))?;
     }
 
     if policy.network != NetworkAccess::Host {
-        unshare(libc::CLONE_NEWNET)?;
+        unshare(libc::CLONE_NEWNET)
+            .map_err(|error| io_context("create network namespace", error))?;
     }
 
     Ok(())
@@ -274,16 +276,27 @@ fn configure_user_mapping() -> std::io::Result<()> {
     let uid = unsafe { libc::getuid() };
     let gid = unsafe { libc::getgid() };
     let _ = std::fs::write("/proc/self/setgroups", "deny");
-    std::fs::write("/proc/self/uid_map", format!("0 {uid} 1\n"))?;
-    std::fs::write("/proc/self/gid_map", format!("0 {gid} 1\n"))?;
+    std::fs::write("/proc/self/uid_map", format!("0 {uid} 1\n"))
+        .map_err(|error| io_context("write uid mapping", error))?;
+    std::fs::write("/proc/self/gid_map", format!("0 {gid} 1\n"))
+        .map_err(|error| io_context("write gid mapping", error))?;
     if unsafe { libc::setresuid(0, 0, 0) } == -1 {
-        return Err(std::io::Error::last_os_error());
+        return Err(io_context(
+            "switch to mapped user identity",
+            std::io::Error::last_os_error(),
+        ));
     }
     if unsafe { libc::setresgid(0, 0, 0) } == -1 {
-        return Err(std::io::Error::last_os_error());
+        return Err(io_context(
+            "switch to mapped group identity",
+            std::io::Error::last_os_error(),
+        ));
     }
     if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } == -1 {
-        return Err(std::io::Error::last_os_error());
+        return Err(io_context(
+            "set no-new-privileges",
+            std::io::Error::last_os_error(),
+        ));
     }
     Ok(())
 }
@@ -410,6 +423,10 @@ fn mount_paths(
 
 fn invalid_cstring(error: std::ffi::NulError) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidInput, error)
+}
+
+fn io_context(operation: &str, error: std::io::Error) -> std::io::Error {
+    std::io::Error::new(error.kind(), format!("{operation}: {error}"))
 }
 
 fn set_process_group() -> std::io::Result<()> {
