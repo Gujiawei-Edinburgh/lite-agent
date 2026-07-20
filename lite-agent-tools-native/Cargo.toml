@@ -6,7 +6,7 @@ edition = "2021"
 [dependencies]
 libc = "0.2"
 thiserror = "2"
-tokio = { version = "1", features = ["io-util", "macros", "process", "rt", "time"] }
+tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt", "sync", "time"] }
 
 [dev-dependencies]
 tempfile = "3"

@@ -11,12 +11,15 @@ use crate::{
     SandboxWarning, UnsupportedPolicyBehavior,
 };
 use std::ffi::CString;
+use std::io::Read;
+use std::os::unix::io::{FromRawFd, RawFd};
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::time::Instant;
+use tokio::io::unix::AsyncFd;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
-use tokio::time::{sleep, Duration};
+use tokio::time::Duration;
 
 #[derive(Debug, Clone, Default)]
 pub struct LinuxNativeBackend;
@@ -35,17 +38,6 @@ impl SandboxBackend for LinuxNativeBackend {
             identity: policy.identity.requested,
         };
         let mut warnings = Vec::new();
-
-        if effective.process.visibility == ProcessVisibility::Isolated {
-            unsupported(
-                SandboxPolicyDimension::Process,
-                &policy.process,
-                "the first Linux launcher does not yet provide PID namespace isolation",
-                &mut effective,
-                &mut warnings,
-                |effective| effective.process.visibility = ProcessVisibility::Host,
-            )?;
-        }
 
         if matches!(effective.filesystem, FilesystemPolicy::Isolated) {
             unsupported(
@@ -105,6 +97,13 @@ impl LinuxNativeBackend {
         }
 
         let effective = resolution.effective.clone();
+        if effective.process.visibility == ProcessVisibility::Isolated {
+            return self
+                .execute_isolated_request(request, effective, resolution.warnings, started)
+                .await;
+        }
+
+        let terminate_descendants = effective.process.terminate_descendants;
         let mut command = Command::new(&request.program);
         command
             .args(&request.args)
@@ -116,9 +115,10 @@ impl LinuxNativeBackend {
             .stderr(std::process::Stdio::piped());
 
         unsafe {
+            let sandbox_effective = effective.clone();
             command.as_std_mut().pre_exec(move || {
                 set_process_group()?;
-                setup_linux_sandbox(&effective)
+                setup_linux_sandbox(&sandbox_effective)
             });
         }
 
@@ -146,15 +146,16 @@ impl LinuxNativeBackend {
         });
 
         let mut cancelled = false;
-        let status = loop {
-            tokio::select! {
-                result = child.wait() => break result?,
-                _ = sleep(Duration::from_millis(20)) => {
-                    if request.cancellation.is_cancelled() {
-                        cancelled = true;
-                        break terminate_child(&mut child, child_pid).await?;
-                    }
-                }
+        let status = tokio::select! {
+            result = child.wait() => result?,
+            _ = request.cancellation.cancelled() => {
+                cancelled = true;
+                terminate_child(
+                    &mut child,
+                    child_pid,
+                    terminate_descendants,
+                )
+                .await?
             }
         };
 
@@ -180,6 +181,114 @@ impl LinuxNativeBackend {
             stdout,
             stderr,
             warnings: resolution.warnings,
+            stdout_truncated: false,
+            stderr_truncated: false,
+            duration: started.elapsed(),
+        })
+    }
+
+    async fn execute_isolated_request(
+        &self,
+        request: SandboxRequest,
+        effective: EffectiveSandboxPolicy,
+        warnings: Vec<SandboxWarning>,
+        started: Instant,
+    ) -> SandboxResult<SandboxOutput> {
+        let (stdout_read, stdout_write) = create_pipe()?;
+        let (stderr_read, stderr_write) = create_pipe()?;
+        let program = path_to_cstring(&request.program).map_err(SandboxError::Io)?;
+        let args = request
+            .args
+            .iter()
+            .map(|arg| CString::new(arg.as_str()).map_err(invalid_cstring))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(SandboxError::Io)?;
+        let environment = request
+            .environment
+            .iter()
+            .map(|(key, value)| CString::new(format!("{key}={value}")).map_err(invalid_cstring))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(SandboxError::Io)?;
+        let argv = cstring_pointers(&program, &args);
+        let envp = environment
+            .iter()
+            .map(|value| value.as_ptr() as usize)
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let cwd = path_to_cstring(&request.cwd).map_err(SandboxError::Io)?;
+
+        let supervisor_pid = unsafe { libc::fork() };
+        if supervisor_pid == -1 {
+            close_fd(stdout_read);
+            close_fd(stdout_write);
+            close_fd(stderr_read);
+            close_fd(stderr_write);
+            return Err(SandboxError::Launch(format!(
+                "fork sandbox supervisor: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+
+        if supervisor_pid == 0 {
+            close_fd(stdout_read);
+            close_fd(stderr_read);
+            if let Err(error) = run_isolated_child(
+                &effective,
+                stdout_write,
+                stderr_write,
+                &cwd,
+                &program,
+                &argv,
+                &envp,
+            ) {
+                let _ = error;
+                unsafe { libc::_exit(127) };
+            }
+            unsafe { libc::_exit(127) };
+        }
+
+        close_fd(stdout_write);
+        close_fd(stderr_write);
+        let stdout = unsafe { std::fs::File::from_raw_fd(stdout_read) };
+        let stderr = unsafe { std::fs::File::from_raw_fd(stderr_read) };
+        let stdout_task = read_output_blocking(stdout);
+        let stderr_task = read_output_blocking(stderr);
+        let pidfd = open_pidfd(supervisor_pid).map_err(SandboxError::Io)?;
+        let pidfd = AsyncFd::new(pidfd).map_err(SandboxError::Io)?;
+        let mut cancelled = false;
+        let status = tokio::select! {
+            result = wait_for_pidfd(supervisor_pid, &pidfd) => result.map_err(SandboxError::Io)?,
+            _ = request.cancellation.cancelled() => {
+                cancelled = true;
+                terminate_pid(supervisor_pid, effective.process.terminate_descendants);
+                wait_for_pidfd(supervisor_pid, &pidfd)
+                    .await
+                    .map_err(SandboxError::Io)?
+            }
+        };
+
+        let stdout = stdout_task
+            .await
+            .map_err(|error| SandboxError::Launch(format!("stdout reader failed: {error}")))?
+            .map_err(SandboxError::Io)?;
+        let stderr = stderr_task
+            .await
+            .map_err(|error| SandboxError::Launch(format!("stderr reader failed: {error}")))?
+            .map_err(SandboxError::Io)?;
+
+        Ok(SandboxOutput {
+            status: if cancelled {
+                SandboxStatus::Cancelled
+            } else if let Some(signal) = exit_signal(&status) {
+                SandboxStatus::Signaled { signal }
+            } else {
+                SandboxStatus::Exited {
+                    code: status.code().unwrap_or(-1),
+                }
+            },
+            stdout,
+            stderr,
+            warnings,
             stdout_truncated: false,
             stderr_truncated: false,
             duration: started.elapsed(),
@@ -252,6 +361,21 @@ fn setup_linux_sandbox(policy: &EffectiveSandboxPolicy) -> std::io::Result<()> {
         configure_user_mapping(uid, gid)?;
     }
 
+    if policy.process.visibility == ProcessVisibility::Isolated {
+        unshare(libc::CLONE_NEWPID).map_err(|error| io_context("create PID namespace", error))?;
+        let child_pid = unsafe { libc::fork() };
+        if child_pid == -1 {
+            return Err(io_context(
+                "fork PID namespace init",
+                std::io::Error::last_os_error(),
+            ));
+        }
+        if child_pid > 0 {
+            wait_for_pid_namespace_init(child_pid);
+        }
+        set_parent_death_signal()?;
+    }
+
     if !matches!(policy.filesystem, FilesystemPolicy::Host) {
         unshare(libc::CLONE_NEWNS).map_err(|error| io_context("create mount namespace", error))?;
         make_mounts_private().map_err(|error| io_context("make mounts private", error))?;
@@ -266,6 +390,99 @@ fn setup_linux_sandbox(policy: &EffectiveSandboxPolicy) -> std::io::Result<()> {
     }
 
     Ok(())
+}
+
+fn run_isolated_child(
+    policy: &EffectiveSandboxPolicy,
+    stdout_fd: RawFd,
+    stderr_fd: RawFd,
+    cwd: &CString,
+    program: &CString,
+    argv: &[usize],
+    envp: &[usize],
+) -> std::io::Result<()> {
+    set_process_group()?;
+    setup_linux_sandbox(policy)?;
+    if unsafe { libc::dup2(stdout_fd, libc::STDOUT_FILENO) } == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if unsafe { libc::dup2(stderr_fd, libc::STDERR_FILENO) } == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if unsafe { libc::chdir(cwd.as_ptr()) } == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if unsafe { libc::execve(program.as_ptr(), argv.as_ptr().cast(), envp.as_ptr().cast()) } == -1 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        unreachable!()
+    }
+}
+
+fn cstring_pointers(program: &CString, args: &[CString]) -> Vec<usize> {
+    std::iter::once(program.as_ptr() as usize)
+        .chain(args.iter().map(|arg| arg.as_ptr() as usize))
+        .chain(std::iter::once(0))
+        .collect()
+}
+
+fn create_pipe() -> SandboxResult<(RawFd, RawFd)> {
+    let mut fds = [0; 2];
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } == -1 {
+        Err(SandboxError::Io(std::io::Error::last_os_error()))
+    } else {
+        Ok((fds[0], fds[1]))
+    }
+}
+
+fn close_fd(fd: RawFd) {
+    unsafe {
+        libc::close(fd);
+    }
+}
+
+fn read_output_blocking(file: std::fs::File) -> tokio::task::JoinHandle<std::io::Result<Vec<u8>>> {
+    tokio::task::spawn_blocking(move || {
+        let mut output = Vec::new();
+        file.take(20 * 1024 * 1024).read_to_end(&mut output)?;
+        Ok(output)
+    })
+}
+
+fn try_wait(pid: libc::pid_t) -> std::io::Result<Option<std::process::ExitStatus>> {
+    let mut status = 0;
+    let result = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+    if result == 0 {
+        Ok(None)
+    } else if result == pid {
+        Ok(Some(std::os::unix::process::ExitStatusExt::from_raw(
+            status,
+        )))
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+fn open_pidfd(pid: libc::pid_t) -> std::io::Result<std::fs::File> {
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) as RawFd };
+    if fd == -1 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+    }
+}
+
+async fn wait_for_pidfd(
+    pid: libc::pid_t,
+    pidfd: &AsyncFd<std::fs::File>,
+) -> std::io::Result<std::process::ExitStatus> {
+    loop {
+        let mut ready = pidfd.readable().await?;
+        if let Some(status) = try_wait(pid)? {
+            return Ok(status);
+        }
+        ready.clear_ready();
+    }
 }
 
 fn unshare(flags: libc::c_int) -> std::io::Result<()> {
@@ -439,17 +656,75 @@ fn set_process_group() -> std::io::Result<()> {
     }
 }
 
+fn set_parent_death_signal() -> std::io::Result<()> {
+    if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) } == -1 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
 async fn terminate_child(
     child: &mut tokio::process::Child,
     child_pid: Option<i32>,
+    terminate_descendants: bool,
 ) -> SandboxResult<std::process::ExitStatus> {
     if let Some(pid) = child_pid {
+        terminate_pid(pid, terminate_descendants);
+    }
+    let _ = child.kill().await;
+    child.wait().await.map_err(SandboxError::Io)
+}
+
+fn terminate_pid(pid: libc::pid_t, terminate_descendants: bool) {
+    if terminate_descendants {
+        for descendant in direct_children(pid) {
+            unsafe {
+                libc::kill(descendant, libc::SIGKILL);
+            }
+        }
         unsafe {
             libc::killpg(pid, libc::SIGKILL);
         }
     }
-    let _ = child.kill().await;
-    child.wait().await.map_err(SandboxError::Io)
+    unsafe {
+        libc::kill(pid, libc::SIGKILL);
+    }
+}
+
+fn direct_children(pid: i32) -> Vec<i32> {
+    std::fs::read_to_string(format!("/proc/{pid}/task/{pid}/children"))
+        .unwrap_or_default()
+        .split_whitespace()
+        .filter_map(|value| value.parse().ok())
+        .collect()
+}
+
+fn wait_for_pid_namespace_init(child_pid: libc::pid_t) -> ! {
+    let mut status = 0;
+    loop {
+        let result = unsafe { libc::waitpid(child_pid, &mut status, 0) };
+        if result == child_pid {
+            break;
+        }
+        if result == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+            continue;
+        }
+        unsafe { libc::_exit(1) };
+    }
+
+    if libc::WIFEXITED(status) {
+        unsafe { libc::_exit(libc::WEXITSTATUS(status)) };
+    }
+    if libc::WIFSIGNALED(status) {
+        let signal = libc::WTERMSIG(status);
+        unsafe {
+            libc::signal(signal, libc::SIG_DFL);
+            libc::kill(libc::getpid(), signal);
+            libc::_exit(128 + signal);
+        }
+    }
+    unsafe { libc::_exit(1) }
 }
 
 fn exit_signal(status: &std::process::ExitStatus) -> Option<i32> {
@@ -482,11 +757,15 @@ mod tests {
     }
 
     #[test]
-    fn strict_pid_isolation_is_rejected() {
+    fn strict_pid_isolation_is_supported() {
         let backend = LinuxNativeBackend;
         let mut policy = SandboxPolicy::workspace_read_write("/tmp");
         policy.process = PolicySetting::strict(crate::ProcessPolicy::default());
-        assert!(backend.resolve_policy(&policy).is_err());
+        let resolution = backend.resolve_policy(&policy).expect("resolution");
+        assert_eq!(
+            resolution.effective.process.visibility,
+            ProcessVisibility::Isolated
+        );
     }
 
     #[test]
@@ -494,11 +773,27 @@ mod tests {
         let backend = LinuxNativeBackend;
         let policy = SandboxPolicy::workspace_read_write("/tmp");
         let resolution = backend.resolve_policy(&policy).expect("resolution");
-        assert_eq!(resolution.warnings.len(), 1);
+        assert!(resolution.warnings.is_empty());
         assert_eq!(
             resolution.effective.process.visibility,
-            ProcessVisibility::Host
+            ProcessVisibility::Isolated
         );
+    }
+
+    #[tokio::test]
+    async fn isolated_process_observes_itself_as_pid_one() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let output = run_shell(
+            SandboxPolicy::workspace_read_write(workspace.path()),
+            workspace.path(),
+            "printf '%s' \"$$\"",
+            CancellationToken::default(),
+        )
+        .await
+        .expect("sandbox execution");
+
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "1");
+        assert!(matches!(output.status, SandboxStatus::Exited { code: 0 }));
     }
 
     #[tokio::test]
@@ -626,9 +921,14 @@ mod tests {
     async fn cancellation_terminates_running_process_group() {
         let workspace = tempfile::tempdir().expect("workspace");
         let cancellation = CancellationToken::default();
+        let child_pid_file = workspace.path().join("child.pid");
+        let command = format!(
+            r#"(/bin/sh -c "/usr/bin/awk '/^NSpid:/ {{print \$NF}}' /proc/self/status > '{}'; /bin/sleep 30") & child=$!; wait $child"#,
+            child_pid_file.display()
+        );
         let request = SandboxRequest {
             program: PathBuf::from("/bin/sh"),
-            args: vec!["-c".to_string(), "sleep 30".to_string()],
+            args: vec!["-c".to_string(), command],
             cwd: workspace.path().to_path_buf(),
             environment: BTreeMap::new(),
             cancellation: cancellation.clone(),
@@ -638,12 +938,38 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(100)).await;
         cancellation.cancel();
-        let output = task
+        let output = tokio::time::timeout(Duration::from_secs(2), task)
             .await
+            .expect("sandbox cancellation timed out")
             .expect("sandbox task")
             .expect("sandbox execution");
 
         assert!(matches!(output.status, SandboxStatus::Cancelled));
+        let child_pid = std::fs::read_to_string(&child_pid_file)
+            .expect("descendant PID marker")
+            .split_whitespace()
+            .last()
+            .expect("host PID")
+            .parse::<i32>()
+            .expect("valid host PID");
+        let mut state = process_state(child_pid);
+        for _ in 0..20 {
+            if matches!(state, None | Some('Z')) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            state = process_state(child_pid);
+        }
+        assert!(
+            matches!(state, None | Some('Z')),
+            "descendant is still running: pid={child_pid}, state={state:?}"
+        );
+    }
+
+    fn process_state(pid: i32) -> Option<char> {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let fields = stat.rsplit_once(')')?.1.trim_start();
+        fields.chars().next()
     }
 
     #[tokio::test]
