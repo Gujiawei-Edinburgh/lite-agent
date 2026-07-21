@@ -1,25 +1,23 @@
-use lite_agent_kernel::model::{FunctionSpec, ModelRequest, ModelResponse};
+use lite_agent_kernel::model::{ModelRequest, ModelResponse};
 use lite_agent_kernel::ChatMessage;
 use lite_agent_observability::{init_file_logging, JsonlTraceCollector};
 use lite_agent_openai::{ChatCompletionsClient, ModelConfig};
-use lite_agent_runtime::functions::{FunctionExecution, SimpleFunction};
 use lite_agent_runtime::{
     builtin_registry, turn_abort_pair, Agent, AgentConfig, AgentError, CompactingContextBuilder,
     CompactionInput, ContextCompactor, FunctionContext, FunctionRegistry, ModelClient, Result,
     ThreadStore, TraceCollector, TurnModelEvent, TurnOutcome, TurnStateEvent, TurnStreamEvent,
 };
 use lite_agent_store_json::JsonFileThreadStore;
-use lite_agent_tools::register_time_tools;
+use lite_agent_tools::sandbox::{SandboxBackend, SandboxPolicy};
+use lite_agent_tools::{
+    register_time_tools, AuthorizationDecision, ExecAuthorizer, ExecCommandConfig, ExecCommandTool,
+};
 use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
-use serde_json::json;
 use std::env;
 use std::io::{self as std_io, Write};
-use std::path::Path;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use tokio::process::Command as TokioCommand;
-use tokio::time::{timeout, Duration};
 
 #[derive(Debug)]
 struct ReplArgs {
@@ -81,8 +79,33 @@ async fn main() -> Result<()> {
 fn example_registry(command_cwd: PathBuf) -> FunctionRegistry {
     let mut registry = builtin_registry();
     register_time_tools(&mut registry);
-    registry.register(exec_command_function(command_cwd));
+    registry.register(ExecCommandTool::new(ExecCommandConfig::new(
+        command_cwd.clone(),
+        native_sandbox_backend(),
+        SandboxPolicy::workspace_read_write_with_host_network(command_cwd),
+        Arc::new(ReplExecAuthorizer),
+    )));
     registry
+}
+
+struct ReplExecAuthorizer;
+
+impl ExecAuthorizer for ReplExecAuthorizer {
+    fn authorize<'a>(
+        &'a self,
+        _request: &'a lite_agent_tools::ExecRequest,
+        _current_policy: &'a SandboxPolicy,
+        _violation: &'a str,
+        _context: &'a FunctionContext,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<AuthorizationDecision>> + Send + 'a>,
+    > {
+        Box::pin(async {
+            Ok(AuthorizationDecision::Deny {
+                reason: "the REPL has no interactive approval service".to_string(),
+            })
+        })
+    }
 }
 
 struct ExampleContextCompactor {
@@ -139,90 +162,23 @@ impl ContextCompactor for ExampleContextCompactor {
     }
 }
 
-fn exec_command_function(
-    command_cwd: PathBuf,
-) -> impl lite_agent_runtime::functions::AgentFunction {
-    SimpleFunction::new(
-        FunctionSpec {
-            name: "exec_command".to_string(),
-            description: concat!(
-                "Run a shell command for local project testing. ",
-                "Use it for multi-step tasks such as listing directories, creating files, ",
-                "and writing markdown inside the configured working directory."
-            )
-            .to_string(),
-            parameters: json!({
-                "type": "object",
-                "required": ["cmd"],
-                "properties": {
-                    "cmd": {
-                        "type": "string",
-                        "description": "Shell command to run."
-                    },
-                    "timeout_ms": {
-                        "type": "integer",
-                        "description": "Optional timeout in milliseconds. Defaults to 30000."
-                    }
-                },
-                "additionalProperties": false
-            }),
-        },
-        move |args: serde_json::Value, _context: FunctionContext| {
-            let cwd = command_cwd.clone();
-            async move {
-                let cmd = args
-                    .get("cmd")
-                    .and_then(|value| value.as_str())
-                    .ok_or_else(|| AgentError::InvalidFunctionArguments {
-                        name: "exec_command".to_string(),
-                        message: "missing string field: cmd".to_string(),
-                    })?
-                    .to_string();
-                let timeout_ms = args
-                    .get("timeout_ms")
-                    .and_then(|value| value.as_u64())
-                    .unwrap_or(30_000);
-
-                let output = run_shell_command(&cwd, &cmd, timeout_ms).await?;
-                Ok(FunctionExecution::Completed { output })
-            }
-        },
-    )
+fn native_sandbox_backend() -> Arc<dyn SandboxBackend> {
+    native_sandbox_backend_impl()
 }
 
-async fn run_shell_command(cwd: &Path, cmd: &str, timeout_ms: u64) -> Result<serde_json::Value> {
-    let mut command = TokioCommand::new("/bin/zsh");
-    command.arg("-lc").arg(cmd).current_dir(cwd);
-
-    let output = timeout(Duration::from_millis(timeout_ms), command.output())
-        .await
-        .map_err(|_| AgentError::Function {
-            name: "exec_command".to_string(),
-            message: format!("command timed out after {timeout_ms}ms"),
-        })?
-        .map_err(|error| AgentError::Function {
-            name: "exec_command".to_string(),
-            message: error.to_string(),
-        })?;
-
-    Ok(json!({
-        "cwd": cwd.display().to_string(),
-        "cmd": cmd,
-        "exit_code": output.status.code(),
-        "success": output.status.success(),
-        "stdout": truncate_output(&String::from_utf8_lossy(&output.stdout)),
-        "stderr": truncate_output(&String::from_utf8_lossy(&output.stderr)),
-    }))
+#[cfg(target_os = "macos")]
+fn native_sandbox_backend_impl() -> Arc<dyn SandboxBackend> {
+    Arc::new(lite_agent_tools::sandbox::MacOsSeatbeltBackend::new())
 }
 
-fn truncate_output(output: &str) -> String {
-    const MAX_CHARS: usize = 20_000;
-    if output.chars().count() <= MAX_CHARS {
-        return output.to_string();
-    }
-    let mut truncated: String = output.chars().take(MAX_CHARS).collect();
-    truncated.push_str("\n...[truncated]");
-    truncated
+#[cfg(target_os = "linux")]
+fn native_sandbox_backend_impl() -> Arc<dyn SandboxBackend> {
+    Arc::new(lite_agent_tools::sandbox::LinuxNativeBackend::new())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn native_sandbox_backend_impl() -> Arc<dyn SandboxBackend> {
+    panic!("the REPL native exec_command backend supports macOS and Linux only")
 }
 
 fn parse_args() -> Result<Command> {

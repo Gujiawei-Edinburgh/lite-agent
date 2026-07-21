@@ -1,8 +1,8 @@
 use super::{
-    EffectiveSandboxPolicy, FilesystemPolicy, IdentityIsolation, NetworkAccess, PolicySetting,
-    ProcessVisibility, SandboxBackend, SandboxError, SandboxOutput, SandboxPolicy,
-    SandboxPolicyDimension, SandboxPolicyResolution, SandboxRequest, SandboxResult, SandboxStatus,
-    SandboxWarning, UnsupportedPolicyBehavior,
+    classify_policy_violation, EffectiveSandboxPolicy, FilesystemPolicy, IdentityIsolation,
+    NetworkAccess, PolicySetting, ProcessVisibility, SandboxBackend, SandboxError, SandboxOutput,
+    SandboxPolicy, SandboxPolicyDimension, SandboxPolicyResolution, SandboxRequest, SandboxResult,
+    SandboxStatus, SandboxWarning, UnsupportedPolicyBehavior,
 };
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -199,6 +199,7 @@ impl MacOsSeatbeltBackend {
                 code: status.code().unwrap_or(-1),
             }
         };
+        let status = classify_policy_violation(status, &stderr);
 
         Ok(SandboxOutput {
             status,

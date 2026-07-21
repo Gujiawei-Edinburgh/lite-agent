@@ -5,10 +5,10 @@
 //! namespace setup performed before `execve`.
 
 use super::{
-    EffectiveSandboxPolicy, FilesystemAccess, FilesystemPolicy, IdentityIsolation, NetworkAccess,
-    PolicySetting, ProcessVisibility, SandboxBackend, SandboxError, SandboxOutput, SandboxPolicy,
-    SandboxPolicyDimension, SandboxPolicyResolution, SandboxRequest, SandboxResult, SandboxStatus,
-    SandboxWarning, UnsupportedPolicyBehavior,
+    classify_policy_violation, EffectiveSandboxPolicy, FilesystemAccess, FilesystemPolicy,
+    IdentityIsolation, NetworkAccess, PolicySetting, ProcessVisibility, SandboxBackend,
+    SandboxError, SandboxOutput, SandboxPolicy, SandboxPolicyDimension, SandboxPolicyResolution,
+    SandboxRequest, SandboxResult, SandboxStatus, SandboxWarning, UnsupportedPolicyBehavior,
 };
 use std::ffi::CString;
 use std::io::Read;
@@ -22,6 +22,12 @@ use tokio::process::Command;
 
 #[derive(Debug, Clone, Default)]
 pub struct LinuxNativeBackend;
+
+impl LinuxNativeBackend {
+    pub fn new() -> Self {
+        Self
+    }
+}
 
 impl SandboxBackend for LinuxNativeBackend {
     fn name(&self) -> &str {
@@ -167,16 +173,19 @@ impl LinuxNativeBackend {
         stdout_result?;
         stderr_result?;
 
+        let status = if cancelled {
+            SandboxStatus::Cancelled
+        } else if let Some(signal) = exit_signal(&status) {
+            SandboxStatus::Signaled { signal }
+        } else {
+            SandboxStatus::Exited {
+                code: status.code().unwrap_or(-1),
+            }
+        };
+        let status = classify_policy_violation(status, &stderr);
+
         Ok(SandboxOutput {
-            status: if cancelled {
-                SandboxStatus::Cancelled
-            } else if let Some(signal) = exit_signal(&status) {
-                SandboxStatus::Signaled { signal }
-            } else {
-                SandboxStatus::Exited {
-                    code: status.code().unwrap_or(-1),
-                }
-            },
+            status,
             stdout,
             stderr,
             warnings: resolution.warnings,
@@ -275,16 +284,19 @@ impl LinuxNativeBackend {
             .map_err(|error| SandboxError::Launch(format!("stderr reader failed: {error}")))?
             .map_err(SandboxError::Io)?;
 
+        let status = if cancelled {
+            SandboxStatus::Cancelled
+        } else if let Some(signal) = exit_signal(&status) {
+            SandboxStatus::Signaled { signal }
+        } else {
+            SandboxStatus::Exited {
+                code: status.code().unwrap_or(-1),
+            }
+        };
+        let status = classify_policy_violation(status, &stderr);
+
         Ok(SandboxOutput {
-            status: if cancelled {
-                SandboxStatus::Cancelled
-            } else if let Some(signal) = exit_signal(&status) {
-                SandboxStatus::Signaled { signal }
-            } else {
-                SandboxStatus::Exited {
-                    code: status.code().unwrap_or(-1),
-                }
-            },
+            status,
             stdout,
             stderr,
             warnings,

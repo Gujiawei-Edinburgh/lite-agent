@@ -11,7 +11,13 @@ use serde_json::{json, Value};
 use std::future::Future;
 use std::pin::Pin;
 
+mod exec_command;
 pub mod sandbox;
+
+pub use exec_command::{
+    ApprovalHandling, AuthorizationDecision, ExecAuthorizer, ExecCommandConfig, ExecCommandTool,
+    ExecRequest, Shell, ThreadExecAuthorizer,
+};
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct GetCurrentTime;

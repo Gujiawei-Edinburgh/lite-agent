@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+lite-agent-kernel = { path = "../lite-agent-kernel" }
 lite-agent-runtime = { path = "../lite-agent-runtime" }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 libc = "0.2"

@@ -138,7 +138,7 @@ impl TurnAbortHandle {
 }
 
 impl TurnAbortSignal {
-    async fn cancelled(&mut self) {
+    pub async fn wait_cancelled(&mut self) {
         if *self.receiver.borrow() {
             return;
         }
@@ -834,7 +834,7 @@ impl Agent {
     {
         tokio::select! {
             result = future => Ok(Some(result)),
-            () = abort_signal.cancelled() => {
+            () = abort_signal.wait_cancelled() => {
                 let reason = "turn aborted by caller".to_string();
                 tracing::info!(thread_id, turn_id, step, "turn aborted");
                 self.abort_turn(thread, turn_id, reason)?;

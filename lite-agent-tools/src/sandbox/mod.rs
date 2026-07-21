@@ -488,10 +488,25 @@ pub struct SandboxOutput {
     pub duration: Duration,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SandboxStatus {
     Exited { code: i32 },
     Signaled { signal: i32 },
     TimedOut,
     Cancelled,
+    PolicyViolation { reason: String },
+}
+
+pub(crate) fn classify_policy_violation(status: SandboxStatus, stderr: &[u8]) -> SandboxStatus {
+    if !matches!(status, SandboxStatus::Exited { .. }) {
+        return status;
+    }
+    let message = String::from_utf8_lossy(stderr);
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("operation not permitted") || lower.contains("permission denied") {
+        return SandboxStatus::PolicyViolation {
+            reason: message.trim().to_string(),
+        };
+    }
+    status
 }
