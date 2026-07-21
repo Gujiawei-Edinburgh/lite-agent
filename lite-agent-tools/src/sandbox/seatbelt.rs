@@ -1,4 +1,4 @@
-use crate::{
+use super::{
     EffectiveSandboxPolicy, FilesystemPolicy, IdentityIsolation, NetworkAccess, PolicySetting,
     ProcessVisibility, SandboxBackend, SandboxError, SandboxOutput, SandboxPolicy,
     SandboxPolicyDimension, SandboxPolicyResolution, SandboxRequest, SandboxResult, SandboxStatus,
@@ -214,7 +214,7 @@ impl MacOsSeatbeltBackend {
 
 fn resolve_process(
     effective: &mut EffectiveSandboxPolicy,
-    setting: &PolicySetting<crate::ProcessPolicy>,
+    setting: &PolicySetting<super::ProcessPolicy>,
     warnings: &mut Vec<SandboxWarning>,
 ) -> SandboxResult<()> {
     if setting.requested.visibility == ProcessVisibility::Isolated {
@@ -284,13 +284,13 @@ fn render_profile(policy: &EffectiveSandboxPolicy) -> SandboxResult<String> {
                 let path = canonical_existing_path(&rule.path);
                 let path = escape_profile_path(&path)?;
                 match rule.access {
-                    crate::FilesystemAccess::ReadWrite => profile.push_str(&format!(
+                    super::FilesystemAccess::ReadWrite => profile.push_str(&format!(
                         "(allow file-write* (subpath \"{path}\"))\n"
                     )),
-                    crate::FilesystemAccess::ReadOnly => profile.push_str(&format!(
+                    super::FilesystemAccess::ReadOnly => profile.push_str(&format!(
                         "(deny file-write* (subpath \"{path}\"))\n"
                     )),
-                    crate::FilesystemAccess::Denied => profile.push_str(&format!(
+                    super::FilesystemAccess::Denied => profile.push_str(&format!(
                         "(deny file-read* (subpath \"{path}\"))\n(deny file-write* (subpath \"{path}\"))\n"
                     )),
                 }
@@ -372,6 +372,9 @@ fn exit_signal(_status: &std::process::ExitStatus) -> Option<i32> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "macos")]
+    use super::super::CancellationToken;
+    use super::super::{FilesystemAccess, ProcessPolicy};
     use super::*;
     #[cfg(target_os = "macos")]
     use std::collections::BTreeMap;
@@ -379,12 +382,9 @@ mod tests {
     #[test]
     fn renders_read_only_workspace_profile() {
         let policy = EffectiveSandboxPolicy {
-            filesystem: FilesystemPolicy::workspace(
-                "/tmp/workspace",
-                crate::FilesystemAccess::ReadOnly,
-            ),
+            filesystem: FilesystemPolicy::workspace("/tmp/workspace", FilesystemAccess::ReadOnly),
             network: NetworkAccess::Denied,
-            process: crate::ProcessPolicy::default(),
+            process: ProcessPolicy::default(),
             identity: IdentityIsolation::Host,
         };
         let profile = render_profile(&policy).expect("profile");
@@ -396,12 +396,9 @@ mod tests {
     #[test]
     fn renders_read_write_workspace_profile() {
         let policy = EffectiveSandboxPolicy {
-            filesystem: FilesystemPolicy::workspace(
-                "/tmp/workspace",
-                crate::FilesystemAccess::ReadWrite,
-            ),
+            filesystem: FilesystemPolicy::workspace("/tmp/workspace", FilesystemAccess::ReadWrite),
             network: NetworkAccess::Host,
-            process: crate::ProcessPolicy::default(),
+            process: ProcessPolicy::default(),
             identity: IdentityIsolation::Host,
         };
         let profile = render_profile(&policy).expect("profile");
@@ -413,7 +410,7 @@ mod tests {
     fn rejects_unsupported_process_isolation_by_default() {
         let backend = MacOsSeatbeltBackend::new();
         let mut policy = SandboxPolicy::workspace_read_write("/tmp/workspace");
-        policy.process = PolicySetting::strict(crate::ProcessPolicy::default());
+        policy.process = PolicySetting::strict(ProcessPolicy::default());
         let error = backend
             .resolve_policy(&policy)
             .expect_err("policy must be rejected");
@@ -493,7 +490,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn cancelled_request_does_not_spawn_sandbox() {
-        let cancellation = crate::CancellationToken::default();
+        let cancellation = CancellationToken::default();
         cancellation.cancel();
         let request = SandboxRequest {
             program: PathBuf::from("/bin/true"),

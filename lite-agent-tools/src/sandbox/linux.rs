@@ -4,7 +4,7 @@
 //! policy. It translates the semantic policy into user, mount, and network
 //! namespace setup performed before `execve`.
 
-use crate::{
+use super::{
     EffectiveSandboxPolicy, FilesystemAccess, FilesystemPolicy, IdentityIsolation, NetworkAccess,
     PolicySetting, ProcessVisibility, SandboxBackend, SandboxError, SandboxOutput, SandboxPolicy,
     SandboxPolicyDimension, SandboxPolicyResolution, SandboxRequest, SandboxResult, SandboxStatus,
@@ -19,7 +19,6 @@ use std::time::Instant;
 use tokio::io::unix::AsyncFd;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
-use tokio::time::Duration;
 
 #[derive(Debug, Clone, Default)]
 pub struct LinuxNativeBackend;
@@ -733,10 +732,11 @@ fn exit_signal(status: &std::process::ExitStatus) -> Option<i32> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::{CancellationToken, FilesystemRule, ProcessPolicy};
     use super::*;
-    use crate::{CancellationToken, FilesystemRule};
     use std::collections::BTreeMap;
     use std::path::PathBuf;
+    use tokio::time::Duration;
 
     async fn run_shell(
         policy: SandboxPolicy,
@@ -760,7 +760,7 @@ mod tests {
     fn strict_pid_isolation_is_supported() {
         let backend = LinuxNativeBackend;
         let mut policy = SandboxPolicy::workspace_read_write("/tmp");
-        policy.process = PolicySetting::strict(crate::ProcessPolicy::default());
+        policy.process = PolicySetting::strict(ProcessPolicy::default());
         let resolution = backend.resolve_policy(&policy).expect("resolution");
         assert_eq!(
             resolution.effective.process.visibility,

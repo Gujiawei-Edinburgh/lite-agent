@@ -19,4 +19,17 @@ jobs:
       - name: Run Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Run non-sandbox tests
-        run: cargo test --workspace -- --skip 'linux::tests::'
+        run: cargo test --workspace -- --skip 'sandbox::linux::tests::'
+
+  linux-sandbox:
+    needs: rust
+    runs-on: ubuntu-latest
+    container:
+      image: rust:1-bookworm
+      options: --privileged
+    steps:
+      - name: Install checkout dependencies
+        run: apt-get update && apt-get install --yes git
+      - uses: actions/checkout@v4
+      - name: Run Linux sandbox tests
+        run: cargo test -p lite-agent-tools 'sandbox::linux::tests::' --lib -- --nocapture

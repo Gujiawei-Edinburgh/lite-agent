@@ -6,8 +6,12 @@ edition = "2021"
 [dependencies]
 lite-agent-runtime = { path = "../lite-agent-runtime" }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+libc = "0.2"
 serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt", "sync", "time"] }
 
 [dev-dependencies]
 lite-agent-kernel = { path = "../lite-agent-kernel" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tempfile = "3"
