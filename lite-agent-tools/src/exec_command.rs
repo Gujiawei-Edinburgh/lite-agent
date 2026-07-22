@@ -383,6 +383,7 @@ impl ExecCommandTool {
                         "shell": request.shell.name(),
                         "reason": reason,
                         "sandbox_violation": violation,
+                        "deferred": true,
                         "attempted": false,
                         "executed": false
                     }),

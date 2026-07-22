@@ -1,6 +1,8 @@
 use crate::context::{CompactingContextBuilder, ContextBuildInput, ContextBuilder};
 use crate::error::{AgentError, Result};
-use crate::functions::{FunctionCallExecution, FunctionContext, FunctionRegistry, RuntimeEffect};
+use crate::functions::{
+    FunctionCallExecution, FunctionContext, FunctionRegistry, RuntimeEffect, SuspensionResolution,
+};
 use crate::model::{ModelClient, ModelRequest, ModelResponse, ModelStreamEvent};
 use crate::store::{ThreadContextCache, ThreadStore};
 use crate::trace::{
@@ -326,6 +328,7 @@ impl Agent {
         &self,
         thread_id: &str,
         suspension_id: &str,
+        resolution: SuspensionResolution,
         on_event: F,
     ) -> Result<TurnOutcome>
     where
@@ -346,90 +349,70 @@ impl Agent {
             if pending.suspension.id != suspension_id {
                 return Err(AgentError::TurnNotFound(suspension_id.to_string()));
             }
-            let call_id = pending
+            let deferred = pending
                 .suspension
                 .payload
-                .get("call_id")
-                .and_then(Value::as_str)
-                .ok_or_else(|| AgentError::Function {
-                    name: "resume_suspended_turn".to_string(),
-                    message: "suspension does not identify a resumable call".to_string(),
-                })?;
-            let call = thread
-                .turns
-                .iter()
-                .find(|turn| turn.id == pending.turn_id)
-                .and_then(|turn| {
-                    turn.items.iter().rev().find_map(|item| match &item.kind {
-                        TurnItemKind::ModelResponse { function_calls, .. } => function_calls
-                            .iter()
-                            .find(|call| call.call_id == call_id)
-                            .cloned(),
-                        _ => None,
-                    })
-                })
-                .ok_or_else(|| AgentError::Function {
-                    name: "resume_suspended_turn".to_string(),
-                    message: "suspended function call was not found".to_string(),
-                })?;
-            on_event(TurnStreamEvent::State(TurnStateEvent::FunctionStarted {
-                call_id: call.call_id.clone(),
-                name: call.name.clone(),
-            }));
-            let context = FunctionContext {
-                thread_id: thread.id.clone(),
-                turn_id: pending.turn_id.clone(),
-                call_id: call.call_id.clone(),
-                projection: projection.clone(),
-                abort_signal: abort_signal.clone(),
-            };
-            let execution =
-                self.function_registry
-                    .call(&call.name, call.arguments.clone(), context);
-            let execution = self
-                .await_step_or_abort(
-                    execution,
-                    &mut abort_signal,
+                .get("deferred")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            if let SuspensionResolution::UserInput { text } = resolution.clone() {
+                if deferred {
+                    return Err(AgentError::Function {
+                        name: "resume_suspended_turn".to_string(),
+                        message: "a pre-execution suspension requires approval or denial"
+                            .to_string(),
+                    });
+                }
+                Self::push_turn_items(
                     &mut thread,
-                    thread_id,
                     &pending.turn_id,
-                    "resumed function call",
-                )
-                .await?;
-            let Some(execution) = execution else {
-                return Ok(TurnOutcome::Aborted {
-                    reason: "turn aborted by caller".to_string(),
-                });
-            };
-            match execution {
-                Ok(FunctionCallExecution::Completed { output, effects }) => {
-                    let mut items = Self::apply_runtime_effects(&thread, effects);
-                    items.push(TurnItem::new(
-                        TurnItemSource::Tool,
-                        TurnItemKind::ToolOutput {
-                            call_id: call.call_id.clone(),
-                            name: call.name.clone(),
-                            result: ToolResult::Success {
-                                output: output.clone(),
-                            },
+                    vec![TurnItem::new(
+                        TurnItemSource::User,
+                        TurnItemKind::UserInput {
+                            text,
+                            response_to: Some(suspension_id.to_string()),
                         },
-                    ));
-                    Self::push_turn_items(&mut thread, &pending.turn_id, items)?;
-                    Self::set_turn_status(&mut thread, &pending.turn_id, TurnStatus::Running)?;
-                    self.commit_thread(thread).await?;
-                    on_event(TurnStreamEvent::State(TurnStateEvent::FunctionCompleted {
-                        call_id: call.call_id,
-                        name: call.name,
-                    }));
-                    true
+                    )],
+                )?;
+                Self::set_turn_status(&mut thread, &pending.turn_id, TurnStatus::Running)?;
+                self.commit_thread(thread).await?;
+                true
+            } else {
+                let call_id = pending
+                    .suspension
+                    .payload
+                    .get("call_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| AgentError::Function {
+                        name: "resume_suspended_turn".to_string(),
+                        message: "suspension does not identify a resumable call".to_string(),
+                    })?;
+                let call = thread
+                    .turns
+                    .iter()
+                    .find(|turn| turn.id == pending.turn_id)
+                    .and_then(|turn| {
+                        turn.items.iter().rev().find_map(|item| match &item.kind {
+                            TurnItemKind::ModelResponse { function_calls, .. } => function_calls
+                                .iter()
+                                .find(|call| call.call_id == call_id)
+                                .cloned(),
+                            _ => None,
+                        })
+                    })
+                    .ok_or_else(|| AgentError::Function {
+                        name: "resume_suspended_turn".to_string(),
+                        message: "suspended function call was not found".to_string(),
+                    })?;
+                if !deferred {
+                    return Err(AgentError::Function {
+                        name: "resume_suspended_turn".to_string(),
+                        message: "approval or denial can only resume a pre-execution suspension"
+                            .to_string(),
+                    });
                 }
-                Ok(FunctionCallExecution::SuspendedBeforeExecution { suspension, .. })
-                | Ok(FunctionCallExecution::Suspended { suspension, .. }) => {
-                    suspended_outcome = Some(TurnOutcome::Suspended { suspension });
-                    false
-                }
-                Err(error) => {
-                    let error_text = error.to_string();
+                if let SuspensionResolution::Deny { reason } = resolution.clone() {
+                    let error_text = format!("execution denied by user: {reason}");
                     Self::push_turn_items(
                         &mut thread,
                         &pending.turn_id,
@@ -452,6 +435,106 @@ impl Agent {
                         error: error_text,
                     }));
                     true
+                } else if matches!(resolution, SuspensionResolution::Approve) {
+                    on_event(TurnStreamEvent::State(TurnStateEvent::FunctionStarted {
+                        call_id: call.call_id.clone(),
+                        name: call.name.clone(),
+                    }));
+                    let context = FunctionContext {
+                        thread_id: thread.id.clone(),
+                        turn_id: pending.turn_id.clone(),
+                        call_id: call.call_id.clone(),
+                        projection: projection.clone(),
+                        abort_signal: abort_signal.clone(),
+                    };
+                    let execution =
+                        self.function_registry
+                            .call(&call.name, call.arguments.clone(), context);
+                    let execution = self
+                        .await_step_or_abort(
+                            execution,
+                            &mut abort_signal,
+                            &mut thread,
+                            thread_id,
+                            &pending.turn_id,
+                            "resumed function call",
+                        )
+                        .await?;
+                    let Some(execution) = execution else {
+                        return Ok(TurnOutcome::Aborted {
+                            reason: "turn aborted by caller".to_string(),
+                        });
+                    };
+                    match execution {
+                        Ok(FunctionCallExecution::Completed { output, effects }) => {
+                            let mut items = Self::apply_runtime_effects(&thread, effects);
+                            items.push(TurnItem::new(
+                                TurnItemSource::Tool,
+                                TurnItemKind::ToolOutput {
+                                    call_id: call.call_id.clone(),
+                                    name: call.name.clone(),
+                                    result: ToolResult::Success {
+                                        output: output.clone(),
+                                    },
+                                },
+                            ));
+                            Self::push_turn_items(&mut thread, &pending.turn_id, items)?;
+                            Self::set_turn_status(
+                                &mut thread,
+                                &pending.turn_id,
+                                TurnStatus::Running,
+                            )?;
+                            self.commit_thread(thread).await?;
+                            on_event(TurnStreamEvent::State(TurnStateEvent::FunctionCompleted {
+                                call_id: call.call_id,
+                                name: call.name,
+                            }));
+                            true
+                        }
+                        Ok(FunctionCallExecution::SuspendedBeforeExecution {
+                            suspension, ..
+                        })
+                        | Ok(FunctionCallExecution::SuspendedAfterExecution {
+                            suspension, ..
+                        }) => {
+                            suspended_outcome = Some(TurnOutcome::Suspended { suspension });
+                            false
+                        }
+                        Err(error) => {
+                            let error_text = error.to_string();
+                            Self::push_turn_items(
+                                &mut thread,
+                                &pending.turn_id,
+                                vec![TurnItem::new(
+                                    TurnItemSource::Tool,
+                                    TurnItemKind::ToolOutput {
+                                        call_id: call.call_id.clone(),
+                                        name: call.name.clone(),
+                                        result: ToolResult::Error {
+                                            error: error_text.clone(),
+                                        },
+                                    },
+                                )],
+                            )?;
+                            Self::set_turn_status(
+                                &mut thread,
+                                &pending.turn_id,
+                                TurnStatus::Running,
+                            )?;
+                            self.commit_thread(thread).await?;
+                            on_event(TurnStreamEvent::State(TurnStateEvent::FunctionFailed {
+                                call_id: call.call_id,
+                                name: call.name,
+                                error: error_text,
+                            }));
+                            true
+                        }
+                    }
+                } else {
+                    return Err(AgentError::Function {
+                        name: "resume_suspended_turn".to_string(),
+                        message: "unsupported suspension resolution".to_string(),
+                    });
                 }
             }
         };
@@ -844,7 +927,7 @@ impl Agent {
                                     }
                                     break 'turn_loop TurnOutcome::Suspended { suspension };
                                 }
-                                Ok(FunctionCallExecution::Suspended {
+                                Ok(FunctionCallExecution::SuspendedAfterExecution {
                                     suspension,
                                     output,
                                     effects,

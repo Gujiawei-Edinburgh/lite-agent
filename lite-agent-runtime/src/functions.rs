@@ -27,10 +27,18 @@ pub enum FunctionExecution {
     SuspendedBeforeExecution {
         suspension: Suspension,
     },
-    Suspended {
+    SuspendedAfterExecution {
         suspension: Suspension,
         output: Value,
     },
+}
+
+#[derive(Debug, Clone)]
+pub enum SuspensionResolution {
+    Approve,
+    Deny { reason: String },
+    UserInput { text: String },
+    ExternalResult { output: Value },
 }
 
 #[derive(Debug, Clone)]
@@ -44,7 +52,7 @@ pub enum RuntimeCommandExecution {
         output: Value,
         effects: Vec<RuntimeEffect>,
     },
-    Suspended {
+    SuspendedAfterExecution {
         suspension: Suspension,
         output: Value,
         effects: Vec<RuntimeEffect>,
@@ -61,7 +69,7 @@ pub enum FunctionCallExecution {
         output: Value,
         effects: Vec<RuntimeEffect>,
     },
-    Suspended {
+    SuspendedAfterExecution {
         suspension: Suspension,
         output: Value,
         effects: Vec<RuntimeEffect>,
@@ -181,8 +189,8 @@ impl FunctionRegistry {
                     output,
                     effects: Vec::new(),
                 }),
-                FunctionExecution::Suspended { suspension, output } => {
-                    Ok(FunctionCallExecution::Suspended {
+                FunctionExecution::SuspendedAfterExecution { suspension, output } => {
+                    Ok(FunctionCallExecution::SuspendedAfterExecution {
                         suspension,
                         output,
                         effects: Vec::new(),
@@ -200,11 +208,11 @@ impl FunctionRegistry {
                     RuntimeCommandExecution::Completed { output, effects } => {
                         Ok(FunctionCallExecution::Completed { output, effects })
                     }
-                    RuntimeCommandExecution::Suspended {
+                    RuntimeCommandExecution::SuspendedAfterExecution {
                         suspension,
                         output,
                         effects,
-                    } => Ok(FunctionCallExecution::Suspended {
+                    } => Ok(FunctionCallExecution::SuspendedAfterExecution {
                         suspension,
                         output,
                         effects,
@@ -350,7 +358,7 @@ impl RuntimeCommand for AskUser {
                 }
             })?;
             let request_id = new_id("req");
-            Ok(RuntimeCommandExecution::Suspended {
+            Ok(RuntimeCommandExecution::SuspendedAfterExecution {
                 suspension: Suspension {
                     id: request_id.clone(),
                     kind: SuspensionKind::UserInput,
@@ -420,7 +428,7 @@ mod tests {
             .await
             .expect("call");
 
-        let FunctionCallExecution::Suspended { suspension, .. } = execution else {
+        let FunctionCallExecution::SuspendedAfterExecution { suspension, .. } = execution else {
             panic!("expected waiting");
         };
         assert_eq!(suspension.kind, SuspensionKind::UserInput);
