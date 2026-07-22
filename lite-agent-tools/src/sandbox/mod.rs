@@ -88,6 +88,10 @@ pub struct CancellationToken {
 }
 
 impl CancellationToken {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
     pub fn cancel(&self) {
         self.cancelled.store(true, Ordering::Release);
         self.notify.notify_waiters();

@@ -286,7 +286,11 @@ impl ExecCommandTool {
             timeout,
         };
 
-        let preflight_request = self.sandbox_request(&request, self.config.policy.clone());
+        let preflight_request = self.sandbox_request(
+            &request,
+            self.config.policy.clone(),
+            CancellationToken::new(),
+        );
         let preflight = self
             .config
             .sandbox
@@ -327,9 +331,8 @@ impl ExecCommandTool {
         policy: SandboxPolicy,
         abort_signal: &mut TurnAbortSignal,
     ) -> Result<SandboxOutput> {
-        let cancellation = CancellationToken::default();
-        let mut sandbox_request = self.sandbox_request(request, policy);
-        sandbox_request.cancellation = cancellation.clone();
+        let cancellation = CancellationToken::new();
+        let sandbox_request = self.sandbox_request(request, policy, cancellation.clone());
         let sandbox = self.config.sandbox.clone();
         let execution = async move { sandbox.execute(sandbox_request).await };
         tokio::pin!(execution);
@@ -418,13 +421,18 @@ impl ExecCommandTool {
         output
     }
 
-    fn sandbox_request(&self, request: &ExecRequest, policy: SandboxPolicy) -> SandboxRequest {
+    fn sandbox_request(
+        &self,
+        request: &ExecRequest,
+        policy: SandboxPolicy,
+        cancellation: CancellationToken,
+    ) -> SandboxRequest {
         SandboxRequest {
             program: request.shell.path().into(),
             args: vec!["-lc".to_string(), request.command.clone()],
             cwd: request.cwd.clone(),
             environment: self.config.environment.clone(),
-            cancellation: CancellationToken::default(),
+            cancellation,
             policy,
         }
     }
