@@ -95,29 +95,40 @@ impl ThreadProjection {
                         call_id,
                         name,
                         result,
-                    } => match result {
-                        ToolResult::Success { output } => {
-                            projection
-                                .completed_function_results
-                                .push(CompletedFunctionCall {
-                                    call_id: call_id.clone(),
+                    } => {
+                        if projection
+                            .pending_suspension
+                            .as_ref()
+                            .and_then(|pending| pending.suspension.payload.get("call_id"))
+                            .and_then(Value::as_str)
+                            == Some(call_id.as_str())
+                        {
+                            projection.pending_suspension = None;
+                        }
+                        match result {
+                            ToolResult::Success { output } => {
+                                projection
+                                    .completed_function_results
+                                    .push(CompletedFunctionCall {
+                                        call_id: call_id.clone(),
+                                        name: name.clone(),
+                                        output: output.clone(),
+                                    });
+                                projection.conversation.push(ChatMessage::Tool {
+                                    tool_call_id: call_id.clone(),
                                     name: name.clone(),
-                                    output: output.clone(),
+                                    content: output.clone(),
                                 });
-                            projection.conversation.push(ChatMessage::Tool {
-                                tool_call_id: call_id.clone(),
-                                name: name.clone(),
-                                content: output.clone(),
-                            });
+                            }
+                            ToolResult::Error { error } => {
+                                projection.conversation.push(ChatMessage::Tool {
+                                    tool_call_id: call_id.clone(),
+                                    name: name.clone(),
+                                    content: Value::String(error.clone()),
+                                });
+                            }
                         }
-                        ToolResult::Error { error } => {
-                            projection.conversation.push(ChatMessage::Tool {
-                                tool_call_id: call_id.clone(),
-                                name: name.clone(),
-                                content: Value::String(error.clone()),
-                            });
-                        }
-                    },
+                    }
                     TurnItemKind::SuspensionCreated { suspension } => {
                         projection.pending_suspension = Some(PendingSuspension {
                             suspension: suspension.clone(),

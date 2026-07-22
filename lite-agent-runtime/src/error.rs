@@ -29,6 +29,12 @@ pub enum AgentError {
     #[error("turn not found: {0}")]
     TurnNotFound(String),
 
+    #[error("thread has an unresolved suspended turn: {thread_id} (suspension {suspension_id})")]
+    SuspendedTurn {
+        thread_id: String,
+        suspension_id: String,
+    },
+
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 

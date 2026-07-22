@@ -47,6 +47,17 @@ pub enum SandboxError {
 pub trait SandboxBackend: Send + Sync {
     fn name(&self) -> &str;
 
+    /// Validate whether a request can be launched under its requested policy.
+    ///
+    /// This is the only phase that may produce an approval suspension. Once
+    /// execution begins, a policy violation is a failed, single-attempt
+    /// execution and must not be retried automatically.
+    fn preflight(&self, request: &SandboxRequest) -> SandboxResult<SandboxPreflight> {
+        request.validate()?;
+        self.resolve_policy(&request.policy)?;
+        Ok(SandboxPreflight::Allowed)
+    }
+
     /// Resolve the requested guarantees into the policy this backend can
     /// actually enforce.
     ///
@@ -58,6 +69,12 @@ pub trait SandboxBackend: Send + Sync {
         &'a self,
         request: SandboxRequest,
     ) -> Pin<Box<dyn Future<Output = SandboxResult<SandboxOutput>> + Send + 'a>>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SandboxPreflight {
+    Allowed,
+    PolicyViolation { reason: String },
 }
 
 /// A cancellation signal shared by the agent runtime and a sandbox backend.

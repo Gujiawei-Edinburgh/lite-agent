@@ -24,6 +24,9 @@ pub enum FunctionExecution {
     Completed {
         output: Value,
     },
+    SuspendedBeforeExecution {
+        suspension: Suspension,
+    },
     Suspended {
         suspension: Suspension,
         output: Value,
@@ -46,6 +49,10 @@ pub enum RuntimeCommandExecution {
         output: Value,
         effects: Vec<RuntimeEffect>,
     },
+    SuspendedBeforeExecution {
+        suspension: Suspension,
+        effects: Vec<RuntimeEffect>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -57,6 +64,10 @@ pub enum FunctionCallExecution {
     Suspended {
         suspension: Suspension,
         output: Value,
+        effects: Vec<RuntimeEffect>,
+    },
+    SuspendedBeforeExecution {
+        suspension: Suspension,
         effects: Vec<RuntimeEffect>,
     },
 }
@@ -177,6 +188,12 @@ impl FunctionRegistry {
                         effects: Vec::new(),
                     })
                 }
+                FunctionExecution::SuspendedBeforeExecution { suspension } => {
+                    Ok(FunctionCallExecution::SuspendedBeforeExecution {
+                        suspension,
+                        effects: Vec::new(),
+                    })
+                }
             },
             RegisteredFunction::RuntimeCommand(command) => {
                 match command.call(args, context).await? {
@@ -190,6 +207,13 @@ impl FunctionRegistry {
                     } => Ok(FunctionCallExecution::Suspended {
                         suspension,
                         output,
+                        effects,
+                    }),
+                    RuntimeCommandExecution::SuspendedBeforeExecution {
+                        suspension,
+                        effects,
+                    } => Ok(FunctionCallExecution::SuspendedBeforeExecution {
+                        suspension,
                         effects,
                     }),
                 }

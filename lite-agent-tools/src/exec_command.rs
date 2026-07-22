@@ -1,5 +1,6 @@
 use crate::sandbox::{
-    CancellationToken, SandboxBackend, SandboxOutput, SandboxPolicy, SandboxRequest, SandboxStatus,
+    CancellationToken, SandboxBackend, SandboxOutput, SandboxPolicy, SandboxPreflight,
+    SandboxRequest, SandboxStatus,
 };
 use lite_agent_kernel::events::{new_id, Suspension, SuspensionKind};
 use lite_agent_runtime::{
@@ -285,6 +286,23 @@ impl ExecCommandTool {
             timeout,
         };
 
+        let preflight_request = self.sandbox_request(&request, self.config.policy.clone());
+        let preflight = self
+            .config
+            .sandbox
+            .preflight(&preflight_request)
+            .map_err(|error| tool_error(format!("sandbox preflight failed: {error}")))?;
+        if let SandboxPreflight::PolicyViolation { reason } = preflight {
+            let decision = self
+                .config
+                .authorizer
+                .authorize(&request, &self.config.policy, &reason, &context)
+                .await
+                .map_err(|error| tool_error(format!("authorization lookup failed: {error}")))?;
+            return self
+                .handle_policy_violation(request, reason, decision, &mut context)
+                .await;
+        }
         let output = self
             .run_sandbox(
                 &request,
@@ -294,15 +312,9 @@ impl ExecCommandTool {
             .await?;
         let output = self.limit_output(output);
         if let SandboxStatus::PolicyViolation { reason } = &output.status {
-            let decision = self
-                .config
-                .authorizer
-                .authorize(&request, &self.config.policy, reason, &context)
-                .await
-                .map_err(|error| tool_error(format!("authorization lookup failed: {error}")))?;
-            return self
-                .handle_policy_violation(request, output, decision, &mut context)
-                .await;
+            return Err(tool_error(format!(
+                "sandbox policy violation after command launch: {reason}; command was not retried"
+            )));
         }
         Ok(self.completed_execution(&request, output))
     }
@@ -316,14 +328,8 @@ impl ExecCommandTool {
         abort_signal: &mut TurnAbortSignal,
     ) -> Result<SandboxOutput> {
         let cancellation = CancellationToken::default();
-        let sandbox_request = SandboxRequest {
-            program: request.shell.path().into(),
-            args: vec!["-lc".to_string(), request.command.clone()],
-            cwd: request.cwd.clone(),
-            environment: self.config.environment.clone(),
-            cancellation: cancellation.clone(),
-            policy,
-        };
+        let mut sandbox_request = self.sandbox_request(request, policy);
+        sandbox_request.cancellation = cancellation.clone();
         let sandbox = self.config.sandbox.clone();
         let execution = async move { sandbox.execute(sandbox_request).await };
         tokio::pin!(execution);
@@ -348,20 +354,18 @@ impl ExecCommandTool {
     async fn handle_policy_violation(
         &self,
         request: ExecRequest,
-        output: SandboxOutput,
+        violation: String,
         decision: AuthorizationDecision,
         context: &mut FunctionContext,
     ) -> Result<FunctionExecution> {
         match decision {
             AuthorizationDecision::Deny { reason } => Err(tool_error(format!(
-                "command denied by authorization policy: {reason}; sandbox violation: {}",
-                output_status_reason(&output.status).unwrap_or("unknown")
+                "command denied by authorization policy: {reason}; sandbox violation: {violation}"
             ))),
             AuthorizationDecision::RequireApproval { reason } => {
                 if self.config.approval_handling == ApprovalHandling::ReturnToolError {
                     return Err(tool_error(format!(
-                        "command requires approval: {reason}; sandbox violation: {}",
-                        output_status_reason(&output.status).unwrap_or("unknown")
+                        "command requires approval: {reason}; sandbox violation: {violation}"
                     )));
                 }
                 let suspension = Suspension {
@@ -370,24 +374,17 @@ impl ExecCommandTool {
                     payload: json!({
                         "tool": "exec_command",
                         "thread_id": context.thread_id,
+                        "call_id": context.call_id,
                         "command": request.command,
                         "cwd": request.cwd,
                         "shell": request.shell.name(),
                         "reason": reason,
-                        "sandbox_violation": output_status_reason(&output.status),
-                        "attempted": true,
+                        "sandbox_violation": violation,
+                        "attempted": false,
                         "executed": false
                     }),
                 };
-                Ok(FunctionExecution::Suspended {
-                    suspension,
-                    output: json!({
-                        "outcome": "approval_required",
-                        "attempted": true,
-                        "executed": false,
-                        "reason": "sandbox policy violation requires explicit approval"
-                    }),
-                })
+                Ok(FunctionExecution::SuspendedBeforeExecution { suspension })
             }
             AuthorizationDecision::Allow { policy } => {
                 if policy == self.config.policy {
@@ -419,6 +416,17 @@ impl ExecCommandTool {
             output.stderr_truncated = true;
         }
         output
+    }
+
+    fn sandbox_request(&self, request: &ExecRequest, policy: SandboxPolicy) -> SandboxRequest {
+        SandboxRequest {
+            program: request.shell.path().into(),
+            args: vec!["-lc".to_string(), request.command.clone()],
+            cwd: request.cwd.clone(),
+            environment: self.config.environment.clone(),
+            cancellation: CancellationToken::default(),
+            policy,
+        }
     }
 
     fn completed_execution(
@@ -465,13 +473,6 @@ fn status_json(status: SandboxStatus) -> Value {
     }
 }
 
-fn output_status_reason(status: &SandboxStatus) -> Option<&str> {
-    match status {
-        SandboxStatus::PolicyViolation { reason } => Some(reason.as_str()),
-        _ => None,
-    }
-}
-
 fn tool_error(message: String) -> AgentError {
     AgentError::Function {
         name: "exec_command".to_string(),
@@ -482,7 +483,9 @@ fn tool_error(message: String) -> AgentError {
 #[cfg(test)]
 mod tests {
     use super::{AuthorizationDecision, ExecAuthorizer, ExecCommandTool, ExecRequest};
-    use crate::sandbox::{SandboxBackend, SandboxOutput, SandboxPolicy, SandboxStatus};
+    use crate::sandbox::{
+        SandboxBackend, SandboxOutput, SandboxPolicy, SandboxPreflight, SandboxStatus,
+    };
     use lite_agent_kernel::projection::ThreadProjection;
     use lite_agent_runtime::{
         turn_abort_pair, AgentFunction, FunctionContext, FunctionExecution, Result,
@@ -516,6 +519,18 @@ mod tests {
     impl SandboxBackend for FakeBackend {
         fn name(&self) -> &str {
             "fake"
+        }
+        fn preflight(
+            &self,
+            _request: &crate::sandbox::SandboxRequest,
+        ) -> crate::sandbox::SandboxResult<SandboxPreflight> {
+            if self.violation {
+                Ok(SandboxPreflight::PolicyViolation {
+                    reason: "test policy violation".to_string(),
+                })
+            } else {
+                Ok(SandboxPreflight::Allowed)
+            }
         }
         fn resolve_policy(
             &self,
