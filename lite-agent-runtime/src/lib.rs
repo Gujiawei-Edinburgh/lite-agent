@@ -3,6 +3,7 @@ pub mod context;
 pub mod error;
 pub mod functions;
 pub mod model;
+pub mod session;
 pub mod store;
 pub mod trace;
 
@@ -24,5 +25,6 @@ pub use functions::{
 pub use model::{
     FunctionSpec, ModelClient, ModelFunctionCall, ModelRequest, ModelResponse, ModelStreamEvent,
 };
-pub use store::{SessionLock, ThreadContextCache, ThreadStore};
+pub use session::{LeaseFence, LocalSessionCoordinator, SessionCoordinator, SessionLease};
+pub use store::{ThreadContextCache, ThreadStore};
 pub use trace::{NoopTraceCollector, TraceCollector, TraceEvent, TraceEventKind, TraceTurnStatus};

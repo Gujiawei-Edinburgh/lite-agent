@@ -1,3 +1,4 @@
+use lite_agent_kernel::RevisionToken;
 use thiserror::Error;
 
 pub type Result<T> = std::result::Result<T, AgentError>;
@@ -13,11 +14,17 @@ pub enum AgentError {
     #[error("thread store directory is already owned: {0}")]
     StoreLocked(String),
 
-    #[error("thread version conflict for {thread_id}: expected {expected}, actual {actual}")]
-    VersionConflict {
+    #[error("invalid revision token")]
+    InvalidRevision,
+
+    #[error("session coordinator error: {0}")]
+    SessionCoordinator(String),
+
+    #[error("thread revision conflict for {thread_id}: expected {expected:?}, actual {actual:?}")]
+    RevisionConflict {
         thread_id: String,
-        expected: u64,
-        actual: u64,
+        expected: RevisionToken,
+        actual: RevisionToken,
     },
 
     #[error("context window exceeded: estimated {estimated} tokens, limit {limit}")]

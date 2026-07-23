@@ -1,7 +1,9 @@
 use fs2::FileExt;
-use lite_agent_kernel::events::{new_id, Thread};
-use lite_agent_runtime::{AgentError, Result, SessionLock, ThreadContextCache, ThreadStore};
-use std::collections::BTreeMap;
+use lite_agent_kernel::{
+    events::{new_id, Thread},
+    RevisionToken,
+};
+use lite_agent_runtime::{AgentError, LeaseFence, Result, ThreadContextCache, ThreadStore};
 use std::fs::{File, OpenOptions};
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -16,8 +18,17 @@ use tokio::sync::Mutex as AsyncMutex;
 pub struct JsonFileThreadStore {
     state_dir: PathBuf,
     _lock: Arc<StoreLock>,
-    session_locks: Arc<std::sync::Mutex<std::collections::BTreeMap<String, SessionLock>>>,
-    commit_lock: Arc<AsyncMutex<()>>,
+    write_lock: Arc<AsyncMutex<()>>,
+}
+
+fn numeric_revision(revision: &RevisionToken) -> Result<u64> {
+    match revision.as_bytes() {
+        [] => Ok(0),
+        bytes if bytes.len() == 8 => Ok(u64::from_be_bytes(
+            bytes.try_into().expect("checked revision length"),
+        )),
+        _ => Err(AgentError::InvalidRevision),
+    }
 }
 
 #[derive(Debug)]
@@ -55,8 +66,7 @@ impl JsonFileThreadStore {
         Ok(Self {
             state_dir,
             _lock: Arc::new(StoreLock { file }),
-            session_locks: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
-            commit_lock: Arc::new(AsyncMutex::new(())),
+            write_lock: Arc::new(AsyncMutex::new(())),
         })
     }
 
@@ -112,22 +122,23 @@ impl JsonFileThreadStore {
         Ok(())
     }
 
-    async fn commit_thread(&self, mut thread: Thread, expected_version: u64) -> Result<Thread> {
-        let _commit_guard = self.commit_lock.lock().await;
+    async fn commit_thread(&self, mut thread: Thread) -> Result<Thread> {
+        let _write_guard = self.write_lock.lock().await;
         Self::validate_thread_id(&thread.id)?;
         let current = match self.load(&thread.id).await {
             Ok(current) => current,
             Err(AgentError::ThreadNotFound(_)) => Thread::new(thread.id.clone()),
             Err(error) => return Err(error),
         };
-        if current.version != expected_version {
-            return Err(AgentError::VersionConflict {
+        if current.revision != thread.revision {
+            return Err(AgentError::RevisionConflict {
                 thread_id: thread.id.clone(),
-                expected: expected_version,
-                actual: current.version,
+                expected: thread.revision.clone(),
+                actual: current.revision,
             });
         }
-        thread.version = expected_version.saturating_add(1);
+        let current_number = numeric_revision(&thread.revision)?;
+        thread.revision = RevisionToken::from_u64(current_number.saturating_add(1));
         thread.touch();
         self.write_thread(&thread).await?;
         Ok(thread)
@@ -152,20 +163,12 @@ impl ThreadStore for JsonFileThreadStore {
         })
     }
 
-    fn commit<'a>(
+    fn compare_and_commit<'a>(
         &'a self,
         thread: Thread,
-        expected_version: u64,
+        _lease_fence: &'a LeaseFence,
     ) -> Pin<Box<dyn Future<Output = Result<Thread>> + Send + 'a>> {
-        Box::pin(async move { self.commit_thread(thread, expected_version).await })
-    }
-
-    fn session_lock(&self, thread_id: &str) -> SessionLock {
-        let mut locks = self.session_locks.lock().expect("session lock registry");
-        locks
-            .entry(thread_id.to_string())
-            .or_insert_with(|| Arc::new(AsyncMutex::new(())))
-            .clone()
+        Box::pin(async move { self.commit_thread(thread).await })
     }
 
     fn load_context_cache<'a>(
@@ -188,7 +191,7 @@ impl ThreadStore for JsonFileThreadStore {
     ) -> Pin<Box<dyn Future<Output = Result<ThreadContextCache>> + Send + 'a>> {
         Box::pin(async move {
             Self::validate_thread_id(&cache.thread_id)?;
-            let _commit_guard = self.commit_lock.lock().await;
+            let _write_guard = self.write_lock.lock().await;
             self.write_context_cache(&cache).await?;
             Ok(cache)
         })
@@ -198,9 +201,10 @@ impl ThreadStore for JsonFileThreadStore {
 #[cfg(test)]
 mod tests {
     use lite_agent_kernel::{
-        GoalState, GoalStatus, Thread, Turn, TurnItem, TurnItemKind, TurnItemSource, TurnStatus,
+        GoalState, GoalStatus, RevisionToken, Thread, Turn, TurnItem, TurnItemKind, TurnItemSource,
+        TurnStatus,
     };
-    use lite_agent_runtime::AgentError;
+    use lite_agent_runtime::{AgentError, LeaseFence};
 
     use super::{JsonFileThreadStore, ThreadContextCache, ThreadStore};
 
@@ -219,12 +223,12 @@ mod tests {
         ));
 
         store
-            .commit(
+            .compare_and_commit(
                 Thread {
                     turns: vec![turn],
                     ..Thread::new("t1")
                 },
-                0,
+                &LeaseFence::from_bytes([]),
             )
             .await
             .expect("commit");
@@ -250,12 +254,12 @@ mod tests {
         ));
         turn.set_status(TurnStatus::Completed);
         let thread = store
-            .commit(
+            .compare_and_commit(
                 Thread {
                     turns: vec![turn],
                     ..Thread::new("t1")
                 },
-                0,
+                &LeaseFence::from_bytes([]),
             )
             .await
             .expect("commit");
@@ -286,11 +290,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_stale_thread_version() {
+    async fn rejects_stale_thread_revision() {
         let temp = tempfile::tempdir().expect("tempdir");
         let store = JsonFileThreadStore::open(temp.path()).expect("store");
-        let created = store.commit(Thread::new("t1"), 0).await.expect("create");
-        assert_eq!(created.version, 1);
+        let created = store
+            .compare_and_commit(Thread::new("t1"), &LeaseFence::from_bytes([]))
+            .await
+            .expect("create");
+        assert_eq!(created.revision, RevisionToken::from_u64(1));
 
         let stale = store.load("t1").await.expect("load");
         let mut current = stale.clone();
@@ -307,17 +314,23 @@ mod tests {
             },
         ));
         current.turns.push(turn);
-        let committed = store.commit(current, stale.version).await.expect("commit");
-        assert_eq!(committed.version, 2);
+        let committed = store
+            .compare_and_commit(current, &LeaseFence::from_bytes([]))
+            .await
+            .expect("commit");
+        assert_eq!(committed.revision, RevisionToken::from_u64(2));
 
-        let error = store.commit(stale, 1).await.expect_err("stale commit");
+        let error = store
+            .compare_and_commit(stale, &LeaseFence::from_bytes([]))
+            .await
+            .expect_err("stale commit");
         assert!(matches!(
             error,
-            AgentError::VersionConflict {
-                expected: 1,
-                actual: 2,
+            AgentError::RevisionConflict {
+                expected,
+                actual,
                 ..
-            }
+            } if expected == RevisionToken::from_u64(1) && actual == RevisionToken::from_u64(2)
         ));
     }
 
@@ -327,7 +340,7 @@ mod tests {
         let store = JsonFileThreadStore::open(temp.path()).expect("store");
         let cache = ThreadContextCache {
             thread_id: "t1".to_string(),
-            source_version: 4,
+            source_revision: RevisionToken::from_u64(4),
             policy_version: "compact-v1".to_string(),
             covered_message_count: 12,
             summary: "Earlier context".to_string(),

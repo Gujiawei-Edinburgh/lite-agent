@@ -1,6 +1,7 @@
 use crate::error::{AgentError, Result};
 use crate::store::ThreadContextCache;
 use lite_agent_kernel::projection::{ChatMessage, ThreadProjection};
+use lite_agent_kernel::RevisionToken;
 use serde_json::Value;
 use std::future::Future;
 use std::pin::Pin;
@@ -15,7 +16,7 @@ pub enum OversizedGroupPolicy {
 
 pub struct ContextBuildInput<'a> {
     pub thread_id: &'a str,
-    pub thread_version: u64,
+    pub thread_revision: &'a RevisionToken,
     pub projection: &'a ThreadProjection,
     pub system_prompt: &'a str,
     pub cached_context: Option<&'a ThreadContextCache>,
@@ -178,7 +179,7 @@ impl ContextBuilder for CompactingContextBuilder {
                 .cloned()
                 .collect();
             let cache_is_current = input.cached_context.is_some_and(|cache| {
-                cache.source_version == input.thread_version
+                cache.source_revision == *input.thread_revision
                     && cache.policy_version == self.policy_version
                     && cache.covered_message_count == omitted.len()
             });
@@ -244,7 +245,7 @@ impl ContextBuilder for CompactingContextBuilder {
             let cache = summary_message.and_then(|message| match message {
                 ChatMessage::System { content } => Some(ThreadContextCache {
                     thread_id: input.thread_id.to_string(),
-                    source_version: input.thread_version,
+                    source_revision: input.thread_revision.clone(),
                     policy_version: self.policy_version.clone(),
                     covered_message_count: omitted.len(),
                     summary: content,
@@ -333,6 +334,7 @@ mod tests {
     };
     use crate::Result;
     use lite_agent_kernel::projection::ThreadProjection;
+    use lite_agent_kernel::RevisionToken;
     use std::future::Future;
     use std::pin::Pin;
     use std::sync::{
@@ -373,7 +375,7 @@ mod tests {
             .build(ContextBuildInput {
                 projection: &projection,
                 thread_id: "t",
-                thread_version: 1,
+                thread_revision: &RevisionToken::from_u64(1),
                 system_prompt: "system",
                 cached_context: None,
             })
@@ -401,7 +403,7 @@ mod tests {
             .build(ContextBuildInput {
                 projection: &projection,
                 thread_id: "t",
-                thread_version: 1,
+                thread_revision: &RevisionToken::from_u64(1),
                 system_prompt: "system",
                 cached_context: None,
             })

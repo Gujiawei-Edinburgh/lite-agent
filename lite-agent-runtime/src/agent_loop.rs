@@ -4,6 +4,7 @@ use crate::functions::{
     FunctionCallExecution, FunctionContext, FunctionRegistry, RuntimeEffect, SuspensionResolution,
 };
 use crate::model::{ModelClient, ModelRequest, ModelResponse, ModelStreamEvent};
+use crate::session::{SessionCoordinator, SessionLease};
 use crate::store::{ThreadContextCache, ThreadStore};
 use crate::trace::{
     NoopTraceCollector, TraceCollector, TraceEvent, TraceEventKind, TraceTurnStatus,
@@ -13,6 +14,7 @@ use lite_agent_kernel::events::{
     TurnItemSource, TurnStatus,
 };
 use lite_agent_kernel::projection::ThreadProjection;
+use lite_agent_kernel::RevisionToken;
 use serde_json::Value;
 use std::future::Future;
 use std::pin::Pin;
@@ -222,6 +224,7 @@ pub struct Agent {
     function_call_hooks: Vec<Arc<dyn FunctionCallHook>>,
     context_builder: Arc<dyn ContextBuilder>,
     trace_collector: Arc<dyn TraceCollector>,
+    session_coordinator: Arc<dyn SessionCoordinator>,
 }
 
 impl Agent {
@@ -230,6 +233,7 @@ impl Agent {
         store: Arc<dyn ThreadStore>,
         model_client: Arc<dyn ModelClient>,
         function_registry: FunctionRegistry,
+        session_coordinator: Arc<dyn SessionCoordinator>,
     ) -> Self {
         Self {
             config,
@@ -239,6 +243,7 @@ impl Agent {
             function_call_hooks: Vec::new(),
             context_builder: Arc::new(CompactingContextBuilder::default()),
             trace_collector: Arc::new(NoopTraceCollector),
+            session_coordinator,
         }
     }
 
@@ -309,12 +314,14 @@ impl Agent {
     where
         F: FnMut(TurnStreamEvent) + Send + 'a,
     {
+        let lease = self.session_coordinator.acquire(thread_id).await?;
         self.run_turn_stream_abortable_internal(
             thread_id,
             Some(user_text.into()),
             abort_signal,
             on_event,
             0,
+            &lease,
         )
         .await
     }
@@ -335,11 +342,10 @@ impl Agent {
         F: FnMut(TurnStreamEvent) + Send + 'a,
     {
         let (_abort_handle, mut abort_signal) = turn_abort_pair();
+        let lease = self.session_coordinator.acquire(thread_id).await?;
         let mut on_event = on_event;
         let mut suspended_outcome = None;
         let should_continue = {
-            let session_lock = self.store.session_lock(thread_id);
-            let _session_lock = session_lock.lock().await;
             let mut thread = self.store.load(thread_id).await?;
             let projection = ThreadProjection::from_thread(&thread);
             let pending = projection
@@ -375,7 +381,7 @@ impl Agent {
                     )],
                 )?;
                 Self::set_turn_status(&mut thread, &pending.turn_id, TurnStatus::Running)?;
-                self.commit_thread(thread).await?;
+                self.commit_thread(thread, lease.fence()).await?;
                 true
             } else {
                 let call_id = pending
@@ -428,7 +434,7 @@ impl Agent {
                         )],
                     )?;
                     Self::set_turn_status(&mut thread, &pending.turn_id, TurnStatus::Running)?;
-                    self.commit_thread(thread).await?;
+                    self.commit_thread(thread, lease.fence()).await?;
                     on_event(TurnStreamEvent::State(TurnStateEvent::FunctionFailed {
                         call_id: call.call_id,
                         name: call.name,
@@ -484,7 +490,7 @@ impl Agent {
                                 &pending.turn_id,
                                 TurnStatus::Running,
                             )?;
-                            self.commit_thread(thread).await?;
+                            self.commit_thread(thread, lease.fence()).await?;
                             on_event(TurnStreamEvent::State(TurnStateEvent::FunctionCompleted {
                                 call_id: call.call_id,
                                 name: call.name,
@@ -521,7 +527,7 @@ impl Agent {
                                 &pending.turn_id,
                                 TurnStatus::Running,
                             )?;
-                            self.commit_thread(thread).await?;
+                            self.commit_thread(thread, lease.fence()).await?;
                             on_event(TurnStreamEvent::State(TurnStateEvent::FunctionFailed {
                                 call_id: call.call_id,
                                 name: call.name,
@@ -543,7 +549,14 @@ impl Agent {
         }
         if should_continue {
             return self
-                .run_turn_stream_abortable_internal(thread_id, None, abort_signal, on_event, 1)
+                .run_turn_stream_abortable_internal(
+                    thread_id,
+                    None,
+                    abort_signal,
+                    on_event,
+                    1,
+                    &lease,
+                )
                 .await;
         }
         Ok(TurnOutcome::Failed {
@@ -558,13 +571,12 @@ impl Agent {
         mut abort_signal: TurnAbortSignal,
         mut on_event: F,
         mut trace_sequence: u64,
+        lease: &SessionLease,
     ) -> Result<TurnOutcome>
     where
         F: FnMut(TurnStreamEvent) + Send + 'a,
     {
-        let session_lock = self.store.session_lock(thread_id);
-        let _session_lock = session_lock.lock().await;
-        tracing::debug!(thread_id, "session lock acquired");
+        tracing::debug!(thread_id, "turn started with session lease");
 
         let mut thread = match self.store.load(thread_id).await {
             Ok(thread) => thread,
@@ -588,7 +600,7 @@ impl Agent {
                 },
             ));
             thread.turns.push(turn);
-            thread = self.commit_thread(thread).await?;
+            thread = self.commit_thread(thread, lease.fence()).await?;
             (turn_id, Some(user_text))
         } else {
             let projection = ThreadProjection::from_thread(&thread);
@@ -628,7 +640,7 @@ impl Agent {
                 let request = self
                     .model_request_from_projection(
                         thread_id,
-                        thread.version,
+                        &thread.revision,
                         session.projection.clone(),
                         cached_context.as_ref(),
                     )
@@ -724,7 +736,7 @@ impl Agent {
                                 &session.active_turn_id,
                                 TurnStatus::Completed,
                             )?;
-                            thread = self.commit_thread(thread).await?;
+                            thread = self.commit_thread(thread, lease.fence()).await?;
                             self.record_trace(
                                 &mut trace_sequence,
                                 thread_id,
@@ -746,7 +758,7 @@ impl Agent {
                                 calls: calls.clone(),
                             },
                         ));
-                        thread = self.commit_thread(thread).await?;
+                        thread = self.commit_thread(thread, lease.fence()).await?;
                         self.record_trace(
                             &mut trace_sequence,
                             thread_id,
@@ -838,7 +850,7 @@ impl Agent {
                                         },
                                     ));
                                     Self::push_turn_items(&mut thread, &turn_id, func_items)?;
-                                    thread = self.commit_thread(thread).await?;
+                                    thread = self.commit_thread(thread, lease.fence()).await?;
                                     self.record_trace(
                                         &mut trace_sequence,
                                         thread_id,
@@ -898,7 +910,7 @@ impl Agent {
                                         &turn_id,
                                         TurnStatus::Suspended,
                                     )?;
-                                    thread = self.commit_thread(thread).await?;
+                                    thread = self.commit_thread(thread, lease.fence()).await?;
                                     for (skipped_call_id, skipped_name, error) in &skipped_calls {
                                         self.record_trace(
                                             &mut trace_sequence,
@@ -988,7 +1000,7 @@ impl Agent {
                                         &turn_id,
                                         TurnStatus::Suspended,
                                     )?;
-                                    thread = self.commit_thread(thread).await?;
+                                    thread = self.commit_thread(thread, lease.fence()).await?;
                                     self.record_trace(
                                         &mut trace_sequence,
                                         thread_id,
@@ -1064,7 +1076,7 @@ impl Agent {
                                             },
                                         )],
                                     )?;
-                                    thread = self.commit_thread(thread).await?;
+                                    thread = self.commit_thread(thread, lease.fence()).await?;
                                     self.record_trace(
                                         &mut trace_sequence,
                                         thread_id,
@@ -1105,7 +1117,7 @@ impl Agent {
         };
 
         Self::apply_turn_token_usage(&mut thread, turn_token_usage);
-        self.commit_thread(thread).await?;
+        self.commit_thread(thread, lease.fence()).await?;
         let trace_status = match &outcome {
             TurnOutcome::AssistantMessage { .. } => TraceTurnStatus::Completed,
             TurnOutcome::Suspended { .. } => TraceTurnStatus::Suspended,
@@ -1232,15 +1244,18 @@ impl Agent {
         }
     }
 
-    async fn commit_thread(&self, thread: Thread) -> Result<Thread> {
-        let expected_version = thread.version;
-        self.store.commit(thread, expected_version).await
+    async fn commit_thread(
+        &self,
+        thread: Thread,
+        lease_fence: &crate::session::LeaseFence,
+    ) -> Result<Thread> {
+        self.store.compare_and_commit(thread, lease_fence).await
     }
 
     async fn model_request_from_projection(
         &self,
         thread_id: &str,
-        thread_version: u64,
+        thread_revision: &RevisionToken,
         projection: ThreadProjection,
         cached_context: Option<&ThreadContextCache>,
     ) -> Result<ModelRequest> {
@@ -1248,7 +1263,7 @@ impl Agent {
             .context_builder
             .build(ContextBuildInput {
                 thread_id,
-                thread_version,
+                thread_revision,
                 projection: &projection,
                 system_prompt: &self.config.system_prompt,
                 cached_context,
@@ -1331,7 +1346,7 @@ mod tests {
         ModelClient, ModelFunctionCall, ModelRequest, ModelResponse, ModelStreamEvent,
         ModelStreamHandler,
     };
-    use crate::store::{SessionLock, ThreadContextCache, ThreadStore};
+    use crate::store::{ThreadContextCache, ThreadStore};
     use crate::{
         turn_abort_pair, Agent, AgentConfig, AgentError, FunctionCallHook, FunctionCallHookContext,
         FunctionCallHookResult, Result, RuntimeEvent, TurnOutcome, TurnStateEvent, TurnStreamEvent,
@@ -1342,15 +1357,12 @@ mod tests {
     use std::collections::VecDeque;
     use std::future::Future;
     use std::pin::Pin;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
-    use tokio::time::{sleep, Duration};
 
     #[derive(Default)]
     struct TestStore {
         threads: Mutex<std::collections::BTreeMap<String, lite_agent_kernel::events::Thread>>,
         caches: Mutex<std::collections::BTreeMap<String, ThreadContextCache>>,
-        locks: Mutex<std::collections::BTreeMap<String, SessionLock>>,
     }
 
     impl ThreadStore for TestStore {
@@ -1369,35 +1381,38 @@ mod tests {
             })
         }
 
-        fn commit<'a>(
+        fn compare_and_commit<'a>(
             &'a self,
             mut thread: lite_agent_kernel::events::Thread,
-            expected_version: u64,
+            _lease_fence: &'a crate::session::LeaseFence,
         ) -> Pin<Box<dyn Future<Output = Result<lite_agent_kernel::events::Thread>> + Send + 'a>>
         {
             Box::pin(async move {
                 let mut threads = self.threads.lock().expect("threads");
-                let current_version = threads.get(&thread.id).map_or(0, |current| current.version);
-                if current_version != expected_version {
-                    return Err(AgentError::VersionConflict {
+                let current_revision = threads
+                    .get(&thread.id)
+                    .map_or_else(lite_agent_kernel::RevisionToken::initial, |current| {
+                        current.revision.clone()
+                    });
+                if current_revision != thread.revision {
+                    return Err(AgentError::RevisionConflict {
                         thread_id: thread.id.clone(),
-                        expected: expected_version,
-                        actual: current_version,
+                        expected: thread.revision.clone(),
+                        actual: current_revision,
                     });
                 }
-                thread.version = expected_version.saturating_add(1);
+                let next = thread
+                    .revision
+                    .as_bytes()
+                    .try_into()
+                    .map(u64::from_be_bytes)
+                    .unwrap_or(0)
+                    .saturating_add(1);
+                thread.revision = lite_agent_kernel::RevisionToken::from_u64(next);
                 thread.touch();
                 threads.insert(thread.id.clone(), thread.clone());
                 Ok(thread)
             })
-        }
-
-        fn session_lock(&self, thread_id: &str) -> SessionLock {
-            let mut locks = self.locks.lock().expect("locks");
-            locks
-                .entry(thread_id.to_string())
-                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-                .clone()
         }
 
         fn load_context_cache<'a>(
@@ -1452,35 +1467,6 @@ mod tests {
         }
     }
 
-    struct SlowCountingModel {
-        active: Arc<AtomicUsize>,
-        max_active: Arc<AtomicUsize>,
-    }
-
-    impl SlowCountingModel {
-        fn new(active: Arc<AtomicUsize>, max_active: Arc<AtomicUsize>) -> Self {
-            Self { active, max_active }
-        }
-    }
-
-    impl ModelClient for SlowCountingModel {
-        fn stream_complete<'a>(
-            &'a self,
-            _request: ModelRequest,
-            _on_event: &'a mut ModelStreamHandler<'a>,
-        ) -> Pin<Box<dyn Future<Output = Result<ModelResponse>> + Send + 'a>> {
-            Box::pin(async move {
-                let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
-                self.max_active.fetch_max(active, Ordering::SeqCst);
-                sleep(Duration::from_millis(50)).await;
-                self.active.fetch_sub(1, Ordering::SeqCst);
-                Ok(ModelResponse::AssistantMessage {
-                    text: "done".to_string(),
-                })
-            })
-        }
-    }
-
     struct PendingModel;
 
     impl ModelClient for PendingModel {
@@ -1499,6 +1485,7 @@ mod tests {
             store,
             Arc::new(MockModel::new(responses)),
             builtin_registry(),
+            Arc::new(crate::session::LocalSessionCoordinator::default()),
         )
     }
 
@@ -1663,35 +1650,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn concurrent_turns_for_same_thread_are_serialized() {
-        let store = Arc::new(TestStore::default());
-        let active = Arc::new(AtomicUsize::new(0));
-        let max_active = Arc::new(AtomicUsize::new(0));
-        let agent = Arc::new(Agent::new(
-            AgentConfig::default(),
-            store.clone(),
-            Arc::new(SlowCountingModel::new(active, max_active.clone())),
-            builtin_registry(),
-        ));
-
-        let first_agent = agent.clone();
-        let first = tokio::spawn(async move { first_agent.run_turn("t", "first").await });
-        let second_agent = agent.clone();
-        let second = tokio::spawn(async move { second_agent.run_turn("t", "second").await });
-
-        first.await.expect("join").expect("first turn");
-        second.await.expect("join").expect("second turn");
-
-        assert_eq!(max_active.load(Ordering::SeqCst), 1);
-        let thread = store.load("t").await.expect("thread");
-        assert_eq!(thread.turns.len(), 2);
-        assert!(thread
-            .turns
-            .iter()
-            .all(|turn| turn.status == TurnStatus::Completed));
-    }
-
-    #[tokio::test]
     async fn abort_during_model_request_persists_aborted_turn() {
         let store = Arc::new(TestStore::default());
         let agent = Arc::new(Agent::new(
@@ -1699,6 +1657,7 @@ mod tests {
             store.clone(),
             Arc::new(PendingModel),
             builtin_registry(),
+            Arc::new(crate::session::LocalSessionCoordinator::default()),
         ));
         let (abort_handle, abort_signal) = turn_abort_pair();
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
@@ -1819,6 +1778,7 @@ mod tests {
             store.clone(),
             Arc::new(UsageModel),
             builtin_registry(),
+            Arc::new(crate::session::LocalSessionCoordinator::default()),
         );
         let events = Arc::new(Mutex::new(Vec::new()));
         let captured = events.clone();
@@ -2125,6 +2085,7 @@ mod tests {
                 }],
             }])),
             builtin_registry(),
+            Arc::new(crate::session::LocalSessionCoordinator::default()),
         );
 
         let outcome = agent.run_turn("t", "goal?").await.expect("turn");

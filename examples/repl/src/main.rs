@@ -4,8 +4,9 @@ use lite_agent_observability::{init_file_logging, JsonlTraceCollector};
 use lite_agent_openai::{ChatCompletionsClient, ModelConfig};
 use lite_agent_runtime::{
     builtin_registry, turn_abort_pair, Agent, AgentConfig, AgentError, CompactingContextBuilder,
-    CompactionInput, ContextCompactor, FunctionContext, FunctionRegistry, ModelClient, Result,
-    ThreadStore, TraceCollector, TurnModelEvent, TurnOutcome, TurnStateEvent, TurnStreamEvent,
+    CompactionInput, ContextCompactor, FunctionContext, FunctionRegistry, LocalSessionCoordinator,
+    ModelClient, Result, ThreadStore, TraceCollector, TurnModelEvent, TurnOutcome, TurnStateEvent,
+    TurnStreamEvent,
 };
 use lite_agent_store_json::JsonFileThreadStore;
 use lite_agent_tools::sandbox::{SandboxBackend, SandboxPolicy};
@@ -67,6 +68,7 @@ async fn main() -> Result<()> {
         store.clone(),
         model_client.clone(),
         example_registry(args.command_cwd),
+        Arc::new(LocalSessionCoordinator::default()),
     )
     .with_shared_trace_collector(trace_collector.clone())
     .with_context_builder(context_builder);

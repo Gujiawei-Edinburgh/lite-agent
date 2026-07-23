@@ -1,4 +1,5 @@
 use crate::model::ModelFunctionCall;
+use crate::RevisionToken;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fmt;
@@ -16,7 +17,7 @@ pub struct Thread {
     #[serde(default = "current_schema_version")]
     pub schema_version: u32,
     #[serde(default)]
-    pub version: u64,
+    pub revision: RevisionToken,
     pub id: ThreadId,
     pub turns: Vec<Turn>,
     #[serde(default)]
@@ -30,7 +31,7 @@ impl Thread {
         let now = now_timestamp();
         Self {
             schema_version: current_schema_version(),
-            version: 0,
+            revision: RevisionToken::initial(),
             id: id.into(),
             turns: Vec::new(),
             token_usage: TokenUsage::default(),
