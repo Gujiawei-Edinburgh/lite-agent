@@ -23,6 +23,8 @@ use tokio::process::Command;
 #[derive(Debug, Clone, Default)]
 pub struct LinuxNativeBackend;
 
+const CHILD_LAUNCH_FAILURE_MARKER: &[u8] = b"lite-agent sandbox child launch failed: ";
+
 impl LinuxNativeBackend {
     pub fn new() -> Self {
         Self
@@ -249,8 +251,13 @@ impl LinuxNativeBackend {
                 &argv,
                 &envp,
             ) {
-                let _ = error;
-                unsafe { libc::_exit(127) };
+                let message = format!(
+                    "{}{}\n",
+                    String::from_utf8_lossy(CHILD_LAUNCH_FAILURE_MARKER),
+                    error
+                );
+                write_fd(stderr_write, message.as_bytes());
+                unsafe { libc::_exit(126) };
             }
             unsafe { libc::_exit(127) };
         }
@@ -283,6 +290,13 @@ impl LinuxNativeBackend {
             .await
             .map_err(|error| SandboxError::Launch(format!("stderr reader failed: {error}")))?
             .map_err(SandboxError::Io)?;
+        if stderr.starts_with(CHILD_LAUNCH_FAILURE_MARKER) {
+            return Err(SandboxError::Launch(
+                String::from_utf8_lossy(&stderr[CHILD_LAUNCH_FAILURE_MARKER.len()..])
+                    .trim()
+                    .to_string(),
+            ));
+        }
 
         let status = if cancelled {
             SandboxStatus::Cancelled
@@ -387,12 +401,19 @@ fn setup_linux_sandbox(policy: &EffectiveSandboxPolicy) -> std::io::Result<()> {
         set_parent_death_signal()?;
     }
 
-    if !matches!(policy.filesystem, FilesystemPolicy::Host) {
+    let isolates_processes = policy.process.visibility == ProcessVisibility::Isolated;
+    let isolates_filesystem = !matches!(policy.filesystem, FilesystemPolicy::Host);
+    if isolates_processes || isolates_filesystem {
         unshare(libc::CLONE_NEWNS).map_err(|error| io_context("create mount namespace", error))?;
         make_mounts_private().map_err(|error| io_context("make mounts private", error))?;
-        make_root_read_only().map_err(|error| io_context("make root read-only", error))?;
-        apply_filesystem_rules(&policy.filesystem)
-            .map_err(|error| io_context("apply filesystem rules", error))?;
+        if isolates_filesystem {
+            make_root_read_only().map_err(|error| io_context("make root read-only", error))?;
+            apply_filesystem_rules(&policy.filesystem)
+                .map_err(|error| io_context("apply filesystem rules", error))?;
+        }
+        if isolates_processes {
+            mount_private_procfs().map_err(|error| io_context("mount private procfs", error))?;
+        }
     }
 
     if policy.network != NetworkAccess::Host {
@@ -449,6 +470,16 @@ fn create_pipe() -> SandboxResult<(RawFd, RawFd)> {
 fn close_fd(fd: RawFd) {
     unsafe {
         libc::close(fd);
+    }
+}
+
+fn write_fd(fd: RawFd, mut bytes: &[u8]) {
+    while !bytes.is_empty() {
+        let written = unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len()) };
+        if written <= 0 {
+            return;
+        }
+        bytes = &bytes[written as usize..];
     }
 }
 
@@ -537,6 +568,16 @@ fn make_mounts_private() -> std::io::Result<()> {
         Path::new("/"),
         None,
         libc::MS_REC | libc::MS_PRIVATE,
+        None,
+    )
+}
+
+fn mount_private_procfs() -> std::io::Result<()> {
+    mount(
+        Some(Path::new("proc")),
+        Path::new("/proc"),
+        Some("proc"),
+        libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
         None,
     )
 }
@@ -805,6 +846,21 @@ mod tests {
         .expect("sandbox execution");
 
         assert_eq!(String::from_utf8_lossy(&output.stdout), "1");
+        assert!(matches!(output.status, SandboxStatus::Exited { code: 0 }));
+    }
+
+    #[tokio::test]
+    async fn isolated_process_uses_procfs_from_its_pid_namespace() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let output = run_shell(
+            SandboxPolicy::workspace_read_write(workspace.path()),
+            workspace.path(),
+            "test \"$(readlink /proc/self/ns/pid)\" = \"$(readlink /proc/1/ns/pid)\"",
+            CancellationToken::default(),
+        )
+        .await
+        .expect("sandbox execution");
+
         assert!(matches!(output.status, SandboxStatus::Exited { code: 0 }));
     }
 
