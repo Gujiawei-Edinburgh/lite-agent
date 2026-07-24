@@ -10,6 +10,24 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
+use std::time::Duration;
+
+#[derive(Debug, Clone)]
+pub struct RetryConfig {
+    pub max_retries: usize,
+    pub initial_backoff: Duration,
+    pub max_backoff: Duration,
+}
+
+impl Default for RetryConfig {
+    fn default() -> Self {
+        Self {
+            max_retries: 2,
+            initial_backoff: Duration::from_millis(250),
+            max_backoff: Duration::from_secs(4),
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct ModelConfig {
@@ -29,6 +47,7 @@ impl ModelConfig {
 pub struct ChatCompletionsClient {
     http: reqwest::Client,
     config: ModelConfig,
+    retry: RetryConfig,
 }
 
 impl ChatCompletionsClient {
@@ -36,7 +55,76 @@ impl ChatCompletionsClient {
         Self {
             http: reqwest::Client::new(),
             config,
+            retry: RetryConfig::default(),
         }
+    }
+
+    pub fn with_retry_config(mut self, retry: RetryConfig) -> Self {
+        self.retry = retry;
+        self
+    }
+
+    async fn send_with_retries(
+        &self,
+        url: &str,
+        body: &OpenAiChatRequest,
+    ) -> Result<reqwest::Response> {
+        for retry_index in 0..=self.retry.max_retries {
+            let response = self
+                .http
+                .post(url)
+                .bearer_auth(&self.config.api_key)
+                .json(body)
+                .send()
+                .await;
+            match response {
+                Ok(response) if response.status().is_success() => return Ok(response),
+                Ok(response) => {
+                    let status = response.status();
+                    let raw = response
+                        .text()
+                        .await
+                        .map_err(|error| AgentError::Http(error.to_string()))?;
+                    if retry_index == self.retry.max_retries || !is_retryable_status(status) {
+                        return Err(AgentError::Http(format!(
+                            "HTTP status {status} for streamed chat/completions: {raw}"
+                        )));
+                    }
+                    self.wait_before_retry(retry_index).await;
+                    tracing::warn!(
+                        status = %status,
+                        retry = retry_index + 1,
+                        max_retries = self.retry.max_retries,
+                        "retrying chat/completions request"
+                    );
+                }
+                Err(error) => {
+                    let retryable = error.is_connect() || error.is_timeout();
+                    if retry_index == self.retry.max_retries || !retryable {
+                        return Err(AgentError::Http(error.to_string()));
+                    }
+                    self.wait_before_retry(retry_index).await;
+                    tracing::warn!(
+                        error = %error,
+                        retry = retry_index + 1,
+                        max_retries = self.retry.max_retries,
+                        "retrying chat/completions request"
+                    );
+                }
+            }
+        }
+        unreachable!("retry loop always returns a response or error")
+    }
+
+    async fn wait_before_retry(&self, retry_index: usize) {
+        let multiplier = 2u32.saturating_pow(retry_index.min(31) as u32);
+        let delay = self
+            .retry
+            .initial_backoff
+            .checked_mul(multiplier)
+            .unwrap_or(self.retry.max_backoff)
+            .min(self.retry.max_backoff);
+        tokio::time::sleep(delay).await;
     }
 }
 
@@ -57,24 +145,7 @@ impl ModelClient for ChatCompletionsClient {
                 request,
                 true,
             );
-            let response = self
-                .http
-                .post(url)
-                .bearer_auth(&self.config.api_key)
-                .json(&body)
-                .send()
-                .await
-                .map_err(|error| AgentError::Http(error.to_string()))?;
-            let status = response.status();
-            if !status.is_success() {
-                let raw = response
-                    .text()
-                    .await
-                    .map_err(|error| AgentError::Http(error.to_string()))?;
-                return Err(AgentError::Http(format!(
-                    "HTTP status {status} for streamed chat/completions: {raw}"
-                )));
-            }
+            let response = self.send_with_retries(&url, &body).await?;
 
             let mut stream = response.bytes_stream();
             let mut buffer = Vec::new();
@@ -104,6 +175,10 @@ impl ModelClient for ChatCompletionsClient {
             })
         })
     }
+}
+
+fn is_retryable_status(status: reqwest::StatusCode) -> bool {
+    matches!(status.as_u16(), 408 | 425 | 429 | 500..=599)
 }
 
 #[derive(Debug, Serialize)]
@@ -439,11 +514,25 @@ struct OpenAiStreamFunctionDelta {
 
 #[cfg(test)]
 mod tests {
-    use super::{consume_sse_frames, handle_sse_frame, ModelStreamEvent, PartialToolCall};
+    use super::{
+        consume_sse_frames, handle_sse_frame, is_retryable_status, ModelStreamEvent,
+        PartialToolCall,
+    };
     use super::{FunctionSpec, ModelFunctionCall, ModelRequest, OpenAiChatRequest};
     use lite_agent_kernel::projection::ChatMessage;
     use serde_json::{json, Value};
     use std::collections::BTreeMap;
+
+    #[test]
+    fn retries_only_transient_http_statuses() {
+        assert!(is_retryable_status(reqwest::StatusCode::TOO_MANY_REQUESTS));
+        assert!(is_retryable_status(
+            reqwest::StatusCode::SERVICE_UNAVAILABLE
+        ));
+        assert!(!is_retryable_status(reqwest::StatusCode::BAD_REQUEST));
+        assert!(!is_retryable_status(reqwest::StatusCode::UNAUTHORIZED));
+        assert!(!is_retryable_status(reqwest::StatusCode::NOT_FOUND));
+    }
 
     #[test]
     fn serializes_structured_tool_history() {

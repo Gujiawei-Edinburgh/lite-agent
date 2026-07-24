@@ -1,3 +1,3 @@
 mod model;
 
-pub use model::{ChatCompletionsClient, ModelConfig};
+pub use model::{ChatCompletionsClient, ModelConfig, RetryConfig};
