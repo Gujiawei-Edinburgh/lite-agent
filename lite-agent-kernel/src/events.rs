@@ -220,6 +220,7 @@ pub struct Suspension {
 pub enum ToolResult {
     Success { output: Value },
     Error { error: String },
+    Aborted { reason: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

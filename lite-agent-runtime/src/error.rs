@@ -42,6 +42,12 @@ pub enum AgentError {
         suspension_id: String,
     },
 
+    #[error("thread has no active turn: {0}")]
+    TurnNotActive(String),
+
+    #[error("thread already has an active turn: {0}")]
+    TurnAlreadyActive(String),
+
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 

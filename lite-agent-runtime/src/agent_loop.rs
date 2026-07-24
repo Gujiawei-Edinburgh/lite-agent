@@ -3,7 +3,7 @@ use crate::error::{AgentError, Result};
 use crate::functions::{
     FunctionCallExecution, FunctionContext, FunctionRegistry, RuntimeEffect, SuspensionResolution,
 };
-use crate::model::{ModelClient, ModelRequest, ModelResponse, ModelStreamEvent};
+use crate::model::{ModelClient, ModelFunctionCall, ModelRequest, ModelResponse, ModelStreamEvent};
 use crate::session::{SessionCoordinator, SessionLease};
 use crate::store::{ThreadContextCache, ThreadStore};
 use crate::trace::{
@@ -16,9 +16,11 @@ use lite_agent_kernel::events::{
 use lite_agent_kernel::projection::ThreadProjection;
 use lite_agent_kernel::RevisionToken;
 use serde_json::Value;
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use tokio::sync::watch;
 
 #[derive(Clone)]
@@ -142,8 +144,16 @@ impl TurnAbortHandle {
 }
 
 impl TurnAbortSignal {
+    pub fn is_cancelled(&self) -> bool {
+        *self.receiver.borrow()
+    }
+
+    pub async fn cancelled(&mut self) {
+        self.wait_cancelled().await;
+    }
+
     pub async fn wait_cancelled(&mut self) {
-        if *self.receiver.borrow() {
+        if self.is_cancelled() {
             return;
         }
         while self.receiver.changed().await.is_ok() {
@@ -205,6 +215,31 @@ struct Session {
     projection: ThreadProjection,
 }
 
+struct ActiveTurn {
+    id: u64,
+    handle: TurnAbortHandle,
+}
+
+struct ActiveTurnGuard {
+    thread_id: String,
+    id: u64,
+    registry: Arc<Mutex<HashMap<String, ActiveTurn>>>,
+    signal: TurnAbortSignal,
+}
+
+impl Drop for ActiveTurnGuard {
+    fn drop(&mut self) {
+        if let Ok(mut active) = self.registry.lock() {
+            if active
+                .get(&self.thread_id)
+                .is_some_and(|turn| turn.id == self.id)
+            {
+                active.remove(&self.thread_id);
+            }
+        }
+    }
+}
+
 impl Session {
     fn from_thread(thread: &Thread, active_turn_id: TurnId) -> Self {
         Self {
@@ -225,6 +260,8 @@ pub struct Agent {
     context_builder: Arc<dyn ContextBuilder>,
     trace_collector: Arc<dyn TraceCollector>,
     session_coordinator: Arc<dyn SessionCoordinator>,
+    active_turns: Arc<Mutex<HashMap<String, ActiveTurn>>>,
+    next_active_turn_id: Arc<AtomicU64>,
 }
 
 impl Agent {
@@ -244,7 +281,40 @@ impl Agent {
             context_builder: Arc::new(CompactingContextBuilder::default()),
             trace_collector: Arc::new(NoopTraceCollector),
             session_coordinator,
+            active_turns: Arc::new(Mutex::new(HashMap::new())),
+            next_active_turn_id: Arc::new(AtomicU64::new(1)),
         }
+    }
+
+    pub fn abort(&self, thread_id: &str) -> Result<()> {
+        let active = self
+            .active_turns
+            .lock()
+            .map_err(|_| AgentError::SessionCoordinator("active turn registry poisoned".into()))?;
+        let turn = active
+            .get(thread_id)
+            .ok_or_else(|| AgentError::TurnNotActive(thread_id.to_string()))?;
+        turn.handle.abort();
+        Ok(())
+    }
+
+    fn register_active_turn(&self, thread_id: &str) -> Result<ActiveTurnGuard> {
+        let (handle, signal) = turn_abort_pair();
+        let id = self.next_active_turn_id.fetch_add(1, Ordering::Relaxed);
+        let mut active = self
+            .active_turns
+            .lock()
+            .map_err(|_| AgentError::SessionCoordinator("active turn registry poisoned".into()))?;
+        if active.contains_key(thread_id) {
+            return Err(AgentError::TurnAlreadyActive(thread_id.to_string()));
+        }
+        active.insert(thread_id.to_string(), ActiveTurn { id, handle });
+        Ok(ActiveTurnGuard {
+            thread_id: thread_id.to_string(),
+            id,
+            registry: self.active_turns.clone(),
+            signal,
+        })
     }
 
     pub fn with_function_call_hook<H>(mut self, hook: H) -> Self
@@ -299,26 +369,12 @@ impl Agent {
     where
         F: FnMut(TurnStreamEvent) + Send + 'a,
     {
-        let (_abort_handle, abort_signal) = turn_abort_pair();
-        self.run_turn_stream_abortable(thread_id, user_text, abort_signal, on_event)
-            .await
-    }
-
-    pub async fn run_turn_stream_abortable<'a, F>(
-        &self,
-        thread_id: &str,
-        user_text: impl Into<String>,
-        abort_signal: TurnAbortSignal,
-        on_event: F,
-    ) -> Result<TurnOutcome>
-    where
-        F: FnMut(TurnStreamEvent) + Send + 'a,
-    {
+        let active_turn = self.register_active_turn(thread_id)?;
         let lease = self.session_coordinator.acquire(thread_id).await?;
         self.run_turn_stream_abortable_internal(
             thread_id,
             Some(user_text.into()),
-            abort_signal,
+            active_turn.signal.clone(),
             on_event,
             0,
             &lease,
@@ -341,8 +397,9 @@ impl Agent {
     where
         F: FnMut(TurnStreamEvent) + Send + 'a,
     {
-        let (_abort_handle, mut abort_signal) = turn_abort_pair();
+        let active_turn = self.register_active_turn(thread_id)?;
         let lease = self.session_coordinator.acquire(thread_id).await?;
+        let mut abort_signal = active_turn.signal.clone();
         let mut on_event = on_event;
         let mut suspended_outcome = None;
         let should_continue = {
@@ -467,6 +524,22 @@ impl Agent {
                         )
                         .await?;
                     let Some(execution) = execution else {
+                        Self::push_turn_items(
+                            &mut thread,
+                            &pending.turn_id,
+                            vec![TurnItem::new(
+                                TurnItemSource::Tool,
+                                TurnItemKind::ToolOutput {
+                                    call_id: call.call_id.clone(),
+                                    name: call.name.clone(),
+                                    result: ToolResult::Aborted {
+                                        reason: "function execution aborted before a result was recorded"
+                                            .to_string(),
+                                    },
+                                },
+                            )],
+                        )?;
+                        self.commit_thread(thread, lease.fence()).await?;
                         return Ok(TurnOutcome::Aborted {
                             reason: "turn aborted by caller".to_string(),
                         });
@@ -822,6 +895,12 @@ impl Agent {
                             };
 
                             let Some(execution) = execution else {
+                                Self::append_aborted_function_outputs(
+                                    &mut thread,
+                                    &turn_id,
+                                    &calls,
+                                    call_index,
+                                )?;
                                 break 'turn_loop TurnOutcome::Aborted {
                                     reason: "turn aborted by caller".to_string(),
                                 };
@@ -1314,6 +1393,32 @@ impl Agent {
         Ok(())
     }
 
+    fn append_aborted_function_outputs(
+        thread: &mut Thread,
+        turn_id: &str,
+        calls: &[ModelFunctionCall],
+        first_unfinished: usize,
+    ) -> Result<()> {
+        let items = calls
+            .iter()
+            .skip(first_unfinished)
+            .map(|call| {
+                TurnItem::new(
+                    TurnItemSource::Tool,
+                    TurnItemKind::ToolOutput {
+                        call_id: call.call_id.clone(),
+                        name: call.name.clone(),
+                        result: ToolResult::Aborted {
+                            reason: "function execution aborted before a result was recorded"
+                                .to_string(),
+                        },
+                    },
+                )
+            })
+            .collect();
+        Self::push_turn_items(thread, turn_id, items)
+    }
+
     fn fail_turn(&self, thread: &mut Thread, turn_id: &str, error: String) -> Result<()> {
         Self::push_turn_items(
             thread,
@@ -1348,7 +1453,7 @@ mod tests {
     };
     use crate::store::{ThreadContextCache, ThreadStore};
     use crate::{
-        turn_abort_pair, Agent, AgentConfig, AgentError, FunctionCallHook, FunctionCallHookContext,
+        Agent, AgentConfig, AgentError, FunctionCallHook, FunctionCallHookContext,
         FunctionCallHookResult, Result, RuntimeEvent, TurnOutcome, TurnStateEvent, TurnStreamEvent,
     };
     use lite_agent_kernel::events::{TokenUsage, ToolResult, TurnItemKind, TurnStatus};
@@ -1659,7 +1764,6 @@ mod tests {
             builtin_registry(),
             Arc::new(crate::session::LocalSessionCoordinator::default()),
         ));
-        let (abort_handle, abort_signal) = turn_abort_pair();
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let started_tx = Arc::new(Mutex::new(Some(started_tx)));
         let events = Arc::new(Mutex::new(Vec::new()));
@@ -1669,7 +1773,7 @@ mod tests {
 
         let turn = tokio::spawn(async move {
             turn_agent
-                .run_turn_stream_abortable("t", "slow", abort_signal, move |event| {
+                .run_turn_stream("t", "slow", move |event| {
                     if matches!(
                         event,
                         TurnStreamEvent::State(TurnStateEvent::TurnStarted { .. })
@@ -1684,7 +1788,7 @@ mod tests {
         });
 
         started_rx.await.expect("turn started");
-        abort_handle.abort();
+        agent.abort("t").expect("active turn");
         let outcome = turn.await.expect("join").expect("turn");
 
         assert!(matches!(outcome, TurnOutcome::Aborted { .. }));

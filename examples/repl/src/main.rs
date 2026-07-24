@@ -3,9 +3,9 @@ use lite_agent_kernel::ChatMessage;
 use lite_agent_observability::{init_file_logging, JsonlTraceCollector};
 use lite_agent_openai::{ChatCompletionsClient, ModelConfig};
 use lite_agent_runtime::{
-    builtin_registry, turn_abort_pair, Agent, AgentConfig, AgentError, CompactingContextBuilder,
-    CompactionInput, ContextCompactor, FunctionContext, FunctionRegistry, LocalSessionCoordinator,
-    ModelClient, Result, ThreadStore, TraceCollector, TurnModelEvent, TurnOutcome, TurnStateEvent,
+    builtin_registry, Agent, AgentConfig, AgentError, CompactingContextBuilder, CompactionInput,
+    ContextCompactor, FunctionContext, FunctionRegistry, LocalSessionCoordinator, ModelClient,
+    Result, ThreadStore, TraceCollector, TurnModelEvent, TurnOutcome, TurnStateEvent,
     TurnStreamEvent,
 };
 use lite_agent_store_json::JsonFileThreadStore;
@@ -277,23 +277,17 @@ async fn run_repl(agent: Agent, store: Arc<JsonFileThreadStore>, thread_id: Stri
 
         let render_state = Arc::new(Mutex::new(StreamRenderState::default()));
         let render_state_for_events = render_state.clone();
-        let (abort_handle, abort_signal) = turn_abort_pair();
-        let turn = agent.run_turn_stream_abortable(
-            &thread_id,
-            input.to_string(),
-            abort_signal,
-            move |event| {
-                if let Ok(mut state) = render_state_for_events.lock() {
-                    print_stream_event(event, &mut state);
-                }
-            },
-        );
+        let turn = agent.run_turn_stream(&thread_id, input.to_string(), move |event| {
+            if let Ok(mut state) = render_state_for_events.lock() {
+                print_stream_event(event, &mut state);
+            }
+        });
         tokio::pin!(turn);
         let outcome = tokio::select! {
             result = &mut turn => result?,
             signal = tokio::signal::ctrl_c() => {
                 signal.map_err(AgentError::Io)?;
-                abort_handle.abort();
+                agent.abort(&thread_id)?;
                 let outcome = turn.await?;
                 println!();
                 outcome

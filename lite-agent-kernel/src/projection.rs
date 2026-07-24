@@ -127,6 +127,15 @@ impl ThreadProjection {
                                     content: Value::String(error.clone()),
                                 });
                             }
+                            ToolResult::Aborted { reason } => {
+                                projection.conversation.push(ChatMessage::Tool {
+                                    tool_call_id: call_id.clone(),
+                                    name: name.clone(),
+                                    content: Value::String(format!(
+                                        "tool execution aborted: {reason}"
+                                    )),
+                                });
+                            }
                         }
                     }
                     TurnItemKind::SuspensionCreated { suspension } => {
@@ -252,6 +261,41 @@ mod tests {
             &projection.conversation[1],
             ChatMessage::Tool { tool_call_id, content, .. }
                 if tool_call_id == "call_1" && content == &json!({ "stdout": "src\n" })
+        ));
+    }
+
+    #[test]
+    fn projects_aborted_tool_output_as_a_tool_message() {
+        let mut thread = Thread::new("t");
+        let mut turn = Turn::new();
+        turn.push_item(TurnItem::new(
+            TurnItemSource::Model,
+            TurnItemKind::ModelResponse {
+                text: None,
+                function_calls: vec![ModelFunctionCall {
+                    call_id: "call_1".to_string(),
+                    name: "exec_command".to_string(),
+                    arguments: json!({ "cmd": "sleep 10" }),
+                }],
+            },
+        ));
+        turn.push_item(TurnItem::new(
+            TurnItemSource::Tool,
+            TurnItemKind::ToolOutput {
+                call_id: "call_1".to_string(),
+                name: "exec_command".to_string(),
+                result: ToolResult::Aborted {
+                    reason: "turn aborted by caller".to_string(),
+                },
+            },
+        ));
+        thread.turns.push(turn);
+
+        let projection = ThreadProjection::from_thread(&thread);
+        assert!(matches!(
+            &projection.conversation[1],
+            ChatMessage::Tool { content, .. }
+                if content == &json!("tool execution aborted: turn aborted by caller")
         ));
     }
 
